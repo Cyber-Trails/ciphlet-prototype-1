@@ -1,0 +1,46 @@
+[project]
+name = "ciphlet"
+version = "0.1.0"
+description = "Ciphlet — Cybersecurity Intelligent Personal Helper for Learning, Exploration & Training"
+requires-python = ">=3.10"
+dependencies = [
+    # Free-provider chain (§20A): Groq + Gemini SDKs. OpenRouter needs no
+    # extra dependency — it's called via stdlib urllib (see
+    # brain/openrouter_provider.py).
+    "groq>=0.9",
+    "google-genai>=0.1",
+    "python-dotenv>=1.0",
+    # Local Intelligence leg (§20A): the official Ollama client, talking to
+    # a persistent `ollama serve` over HTTP (see brain/ollama_provider.py).
+    # Core, not optional — "completely free/local baseline that remains
+    # usable with zero API credits" must always be available. Requires
+    # Ollama itself installed separately on the Pi (see deploy script).
+    "ollama>=0.4",
+]
+
+[project.optional-dependencies]
+# Premium Cloud Intelligence leg — only needed if you'll ever run
+# `ciphlet chat --premium` / `ciphlet voice --premium` (opt-in, metered).
+premium = [
+    "anthropic>=0.40",
+]
+# Voice pipeline (§20B) — wake word, VAD, STT, TTS, mic/speaker I/O.
+# Adopt-adapt evidence for this combination: docs/THIRD_PARTY_NOTICES.md.
+voice = [
+    "sounddevice>=0.4",
+    "numpy>=1.26",
+    "vosk>=0.3.45",
+    "openwakeword>=0.6",
+    "webrtcvad>=2.0.10",
+    "piper-tts>=1.2",
+]
+
+[project.scripts]
+ciphlet = "ciphlet.main:cli"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ciphlet*"]

@@ -1,0 +1,208 @@
+# CIPHLET — Verified State (Brain/Router/Memory, Batch 1)
+
+**Purpose:** keep code-inspected state and actual Raspberry Pi–verified state visibly separate, so future work doesn't quietly erode or reinvent evidence that already exists. This file tracks the `ciphlet/` Python package's brain/router/memory subsystem specifically (§20A/§20B of the architecture doc) — not the broader/older reported build described in `CIPHLET_CURRENT_STATE.md`.
+
+Status vocabulary used below, matching the Core Verification Gate categories:
+
+- **ALREADY PI VERIFIED** — actually run and observed working on the real Raspberry Pi.
+- **IMPLEMENTED / CODE INSPECTED** — code exists, reads correctly, and (where noted) passed a Mac-side logic test — but has not been executed on the Pi.
+- **PI VERIFICATION REQUIRED** — needs to actually be run on the Pi before it can be trusted.
+- **INCOMPLETE** — a known gap, visible from the code itself, not yet addressed.
+- **ACCEPTED BASELINE (LOCKED)** — owner-accepted as the current working configuration after real Pi verification. Not to be further optimized or redesigned without an explicit new instruction to do so.
+
+---
+
+## ACCEPTED BASELINE (LOCKED) — Local Brain
+
+**Status: ALREADY PI VERIFIED — ACCEPTED BASELINE, LOCKED.** Do not further optimize or redesign the local brain against this baseline without an explicit new instruction — this supersedes the tuning history below as the settled configuration.
+
+- Model: **`gemma3:1b-it-q4_K_M`** via a persistent Ollama server (`/api/chat`, `keep_alive=-1` — confirmed on real Pi hardware that the model stays resident between turns, `load_duration=0.0s` on turn 2).
+- Compact, purpose-built local system prompt (`ciphlet/brain/ollama_provider.py::_LOCAL_SYSTEM_PROMPT`) — identity/mentor-role/personality/safety/memory-continuity preserved; defaults to direct, technically accurate answers with no unsolicited analogies/restatements/emojis/follow-ups.
+- Local raw-history window bounded to 6 messages (`CIPHLET_OLLAMA_HISTORY_MESSAGES`, `_bound_history`) — confirmed on real Pi data keeping prompt tokens bounded (467, then 546) rather than growing unbounded (the original ~1150-1200 problem). Full SQLite conversation history is untouched and remains authoritative.
+- Streaming (`on_token`) and Ollama-metadata-based timing diagnostics (`last_timing`, surfaced via `[brain]` reporting) — both confirmed working on real Pi hardware.
+- `--local-only` operation confirmed working on the Pi at zero API credit cost.
+- Known, accepted, verified-on-real-hardware limitation: Ollama's CPU-backend prompt/KV-cache reuse across separate `/api/chat`/`/api/generate` calls does not provide a measurable benefit on this installation (see "Local Qwen... round" entries below for the investigation) — every local turn does a full, but correctly bounded, prompt evaluation. This is accepted as part of the baseline, not a defect to keep chasing.
+
+This section is the authoritative current state for the local brain. Everything below this point is the historical tuning/investigation trail that led here (kept for context on what was tried and why) — it does not describe the current configuration where it conflicts with the summary above.
+
+---
+
+## Clean Rebuild / Adopt-Adapt — local intelligence + voice pipeline replaced
+
+**Everything below this section (the three `local_provider.py`/llama-cli rounds) describes a superseded approach.** The per-request `llama-cli` subprocess local brain was abandoned after being implemented, deployed, and proven unusable on the Pi across three repair rounds (context/timeout hang, then a build-incompatible `-no-cnv` flag) — kept below only as historical record of what was tried and why it didn't work, not as current state.
+
+**What replaced it:** `ciphlet/brain/ollama_provider.py` — a persistent Ollama server (`ollama serve`, contacted over local HTTP with `keep_alive=-1` so the model is never reloaded per turn) running **`gemma2:2b-instruct-q4_0`** by default (replacing the earlier forced Qwen2.5-3B choice). Chosen using real donor evidence from two independent Pi voice-assistant projects — see `docs/THIRD_PARTY_NOTICES.md` for the sources and exactly what was adopted vs. independently written.
+
+Also replaced: `FasterWhisperSTT` → `VoskSTT` (`ciphlet/voice/providers.py`, donor-evidenced), and a real fix (not just a documented gap) for the openWakeWord chunk-size mismatch in `ciphlet/voice/pipeline.py` (`HandsFreeVoiceSession._check_wake` — accumulates VAD-sized frames into properly-sized ~80ms windows before calling the wake model, pattern adapted from `Ambidiosidad/jarvis`, Apache-2.0).
+
+Unchanged/preserved: `Orchestrator`, `Session`, `MemoryStore`/SQLite schema and cross-restart continuity, `BrainRouter` and its Groq→Gemini→OpenRouter→local chain order, `last_brain`/`[brain]` reporting, `--local-only`/`--premium`/`--new-session`/`--no-memory` CLI behavior, identity grounding pattern, Claude's opt-in-only premium path, `PiperTTS` (already matched proven donor usage, unchanged).
+
+**Mac-side verification performed** (proportional — no real Ollama server, VOSK model, or Pi audio hardware available here):
+- `OllamaBrainProvider` exercised against a fake `ollama` module (injected via `sys.modules`, not a real install): confirmed `keep_alive=-1` is sent on every call (the actual mechanism that satisfies "persistent, no reload per turn"), confirmed correct model/identity grounding, confirmed connection-failure and missing-package paths both raise `BrainUnavailableError` cleanly rather than crashing.
+- Full `Orchestrator`/`BrainRouter` integration re-tested with the new provider in both `--local-only` (cloud stub raises if ever called — still never touched) and AUTO-mode cloud-failure-falls-back-to-local (with the required visible degraded notice) scenarios.
+- `VoskSTT` exercised against a fake `vosk` module: confirmed correct API usage and clean failure when the package is absent.
+- The wake-word chunk fix verified directly: fed 10 real 480-sample VAD frames through `_check_wake`, confirmed the wake model was only ever called with exactly 1280-sample (2560-byte) windows, never the raw undersized frames.
+- Full prior Batch 1 regression suite (cross-restart continuity, empty-session exclusion, `--new-session`, `--no-memory`) re-run unchanged against the new local provider — all still pass.
+- `python3 -m py_compile` across the full tree, `tomllib` parse of `pyproject.toml`, `bash -n` on the deploy script — all clean.
+
+**Status: IMPLEMENTED / CODE INSPECTED — Mac-verified at the code-correctness level (including the specific "keep_alive=-1" mechanism that is the actual fix for the prior failure) — PI INTEGRATION NOT YET VERIFIED.** None of Ollama itself, the pulled model's real latency/quality, VOSK transcription accuracy, Piper audio output, or real microphone/speaker/wake-word behavior have been observed on the actual Pi. Do not treat any of this as "working" until `deploy/install_pi.sh` has actually been run and `ciphlet chat --local-only` (and, separately, `ciphlet voice`) have been observed producing a real reply on the device.
+
+---
+
+## Local Qwen integration (llama.cpp `llama-cli`)
+
+**Owner-supplied Pi evidence (proven, real hardware — not re-derived here):** a built llama.cpp executable (`llama-cli`) and the Qwen2.5-3B-Instruct-Q4_K_M GGUF model exist and run on the Pi, observed at ~27.4 prompt tok/s / ~5.8 generation tok/s. **This benchmark is of the raw binary+model only** — it does not by itself prove this Python integration works; see below.
+
+**What changed:** `ciphlet/brain/local_provider.py` was rewritten from calling the `llama-cpp-python` bindings (a separate, never-installed/never-verified build chain) to invoking the actual proven `llama-cli` executable directly via `subprocess`. It builds a Qwen2.5 ChatML prompt from the exact system/history/current-turn the orchestrator already provides, runs `llama-cli -m <model> -p <prompt> -n 256 -c <ctx> --temp 0.7 --no-display-prompt --simple-io [-t <threads>]`, and extracts the reply from stdout (defensively stripping an echoed prompt and trailing ChatML/EOS markers regardless of whether `--no-display-prompt` was honored by the installed build). Missing binary, missing model, non-zero exit, and timeout are all caught and raised as `BrainUnavailableError` with the actual diagnostic detail (exit code / stderr tail), not a crash or a silent wrong answer.
+
+**Configuration (no owner-specific paths hard-coded):** two new env vars, `CIPHLET_LOCAL_LLAMA_BIN` (executable path) and `CIPHLET_LOCAL_TIMEOUT_S` (default 180s, generous given the observed ~5.8 tok/s generation speed and the possibility of a long prompt at ~27.4 tok/s prompt-processing). `CIPHLET_LOCAL_MODEL_PATH`/`CIPHLET_LOCAL_N_CTX`/`CIPHLET_LOCAL_THREADS` already existed and are reused unchanged. `pyproject.toml`'s `local` extras group (previously `llama-cpp-python`) was removed — nothing to `pip install` for this leg anymore, only the externally-built binary/model.
+
+**Routing preserved:** `--local-only` still routes exclusively through `Orchestrator._active_brain()`'s `LOCAL_ONLY` branch straight to the local provider, bypassing `BrainRouter`/the cloud chain entirely — unchanged from prior batches, since only `LocalBrainProvider`'s internals and constructor changed, not the routing/orchestration logic. `[brain]` reporting is unaffected — `LocalBrainProvider.name`/`.model` still feed the same identity mechanism used throughout.
+
+**Mac-side checks performed (proportional — code-correctness only, explicitly not Pi/model verification):**
+- ChatML prompt construction and reply-extraction logic unit-tested directly (with/without simulated prompt echo, with/without trailing markers).
+- Full `LocalBrainProvider.generate()` exercised against a fake stand-in "llama-cli" script (not the real binary — none exists on this Mac) to verify the subprocess command is built and invoked correctly, and that output parsing works.
+- All four failure paths verified clean (`BrainUnavailableError`, not a crash) against the same stand-in: unconfigured, missing binary file, missing model file, non-zero exit code, and a real subprocess timeout.
+- Full `Orchestrator` + `BrainRouter` integration test: constructed a cloud provider stub that raises `AssertionError` if ever called, confirmed `--local-only`/`BrainMode.LOCAL_ONLY` never invokes it and correctly routes only to the local leg, with `orchestrator.last_brain` reporting the correct local identity.
+- Full regression re-run of all prior Batch 1 checks (cross-restart continuity, empty-session exclusion, `--new-session`, `--no-memory`, CLI parsing) — all still pass.
+- `python3 -m py_compile` across the full tree, `tomllib` parse of `pyproject.toml` — clean.
+
+**Status: IMPLEMENTED / CODE INSPECTED — Mac-verified at the code-correctness level only — PI INTEGRATION NOT YET VERIFIED.** The real `llama-cli` binary was never invoked from this session (no such binary exists on this Mac, and Pi runtime verification was explicitly out of scope here). Do **not** treat this as "local Qwen working on the Pi" until an actual `ciphlet chat --local-only` run against the real binary/model has been observed and reported. Specific things that can only be confirmed by that real run: whether the installed `llama-cli` build actually accepts `--no-display-prompt`/`--simple-io` (the code tolerates their absence failing loudly, but hasn't been proven against the real build), whether Qwen's ChatML output matches the assumed markers exactly, and real end-to-end latency against `CIPHLET_LOCAL_TIMEOUT_S=180`.
+
+**Update — the first real Pi run failed.** `ciphlet chat --local-only` correctly routed to `LocalBrainProvider` and correctly resumed 12 prior persisted messages (proving the memory/routing work from earlier fixes held) — but the actual `llama-cli` inference call then timed out after the full 180s.
+
+### Local Qwen, round 2 — root cause and fix for the 180s timeout/hang
+
+**Diagnosis (two independent, complementary causes identified from the reported evidence, not guessed):**
+
+1. **Unbounded prompt vs. a small context window.** The reported subprocess included the full system prompt (identity + memory-continuity instructions) plus all 12 resumed messages, bounded only by `-c 2048` with no input-side sizing. Reconstructing that exact shape on Mac (12 realistic prior messages + system prompt) estimates ~2225 tokens — already over the 2048-token window before the 256-token output reserve. Once a prompt reaches/exceeds `-c`, llama.cpp must context-shift/reprocess, which is dramatically slower than normal prompt processing and can plausibly exceed 180s. The previous implementation sent whatever Orchestrator loaded (up to 20 messages) with no local-side bound at all.
+2. **Possible interactive-mode stdin wait.** The previous subprocess call passed neither `-no-cnv` nor an explicit `stdin=`, so it inherited Ciphlet's own interactive terminal stdin. Recent llama.cpp builds can auto-enter a conversational mode for chat models that, after producing one reply, waits on stdin for the next turn instead of exiting — which would hang indefinitely on an inherited, never-EOF stdin until killed by the timeout. This is consistent with, though not independently confirmable as, part of the observed failure.
+
+**Fix (`ciphlet/brain/local_provider.py` only):**
+- New `_fit_history()`: estimates a conservative (character-based, intentionally low chars/token) token budget from `n_ctx`, always preserves the full system prompt untouched, and keeps as much of the *most recent* conversation as fits — oldest messages dropped first, current turn always kept. Applied before building the ChatML prompt.
+- Added `-no-cnv` to the `llama-cli` invocation (forces single-shot completion instead of any auto conversation mode) and explicit `stdin=subprocess.DEVNULL` (guarantees no stdin read can ever block, regardless of build/flag behavior).
+- `CIPHLET_LOCAL_TIMEOUT_S` was deliberately left unchanged (still 180s) — the fix is bounding the input and closing the interactive-mode risk, not widening the timeout, per instruction.
+
+**Mac-side verification (proportional — no real Pi/model access):**
+- Reconstructed the exact reported shape (12 prior messages + system prompt) and confirmed `_fit_history` trims it to fit within the 2048-token budget while always preserving the full system prompt and the current turn, and confirmed short conversations are left completely untrimmed (no unnecessary context loss).
+- Confirmed via a stand-in script that `-no-cnv` is present in every invocation and that `stdin=subprocess.DEVNULL` actually prevents a simulated stdin-wait hang (returned in ~0.2s against a 10s timeout, where it would otherwise have hung the full 10s).
+- Re-ran the full `--local-only` / `Orchestrator` / `BrainRouter` routing test (cloud leg stub raises if ever called) and all four failure-path tests (unconfigured, missing binary, missing model, non-zero exit) — all still pass unchanged.
+- `python3 -m py_compile` across the full tree — clean.
+
+**Status: IMPLEMENTED / CODE INSPECTED — Mac-reproduced against the exact reported failure shape and Mac-verified — PI INTEGRATION STILL NOT VERIFIED.** This targets the two most evidence-consistent causes of the timeout; it cannot be proven against the real `llama-cli` build/model from this machine. If it still hangs or times out on the next Pi run, that would mean either the real prompt is larger than this estimate accounts for (the token estimate is deliberately conservative but is not the real tokenizer), or the hang source is neither of the two causes addressed here.
+
+**Update — round 2's `-no-cnv` flag was confirmed rejected by the real Pi build.** `ciphlet chat --local-only` returned immediately (proving the timeout/hang itself was resolved — the `_fit_history` context bound and `stdin=DEVNULL` worked) but `llama-cli` exited with `error: invalid argument: -no-cnv`. Proven Pi build: llama.cpp **b11021-87f9c82f2**.
+
+### Local Qwen, round 3 — `-no-cnv` compatibility fix
+
+**Diagnosis:** this build's `llama-cli` does not recognize any `-cnv`/`-no-cnv`-family argument — strong evidence it predates the auto-conversation-mode feature that flag pair was introduced for, meaning there is no such mode to opt out of on this build. Plain `-p <prompt>` without `-i`/`--interactive` already runs classic single-shot completion here.
+
+**Fix (`ciphlet/brain/local_provider.py` only):** removed `-no-cnv` from the command entirely — no replacement flag guessed/substituted, since a wrong guess risks the identical "invalid argument" failure for a different reason. `stdin=subprocess.DEVNULL` (kept, unchanged) is now the sole/primary safeguard against any blocking wait, and does not depend on any flag being recognized. `_fit_history` context-bounding, output parsing, identity grounding, `--local-only` routing, and `CIPHLET_LOCAL_TIMEOUT_S` (still 180s, not increased) are all unchanged from round 2.
+
+**Mac-side verification:** a stand-in script reproduced the exact reported rejection (`error: invalid argument: -no-cnv`, exit 1) against the old command, then confirmed the fixed command (no `-cnv`-family flag) succeeds against the same stand-in; re-confirmed `stdin=DEVNULL` still prevents a simulated stdin-wait hang; re-confirmed `_fit_history` unchanged; re-ran `--local-only`/`Orchestrator`/`BrainRouter` routing + all four failure-path tests — all pass. `python3 -m py_compile` clean.
+
+**Status: IMPLEMENTED / CODE INSPECTED — Mac-reproduced against the exact reported error and Mac-verified — PI INTEGRATION STILL NOT VERIFIED.** This is the third round against this one integration; treat "PI INTEGRATION WORKING" as unconfirmed until an actual successful `ciphlet chat --local-only` exchange is reported from the Pi.
+
+---
+
+## Pi failure #1 — cross-restart recall (found, diagnosed, fixed)
+
+**Owner-reported Pi result:** CIPHLET correctly announced it was resuming the previous session, and `[brain]` reporting worked — but it could not recall what was discussed before the restart.
+
+**Root cause (confirmed via Mac reproduction, not guessed):** `MemoryStore.latest_session_id()` originally picked the most recently *started* session (`sessions.started_at`), not the most recently *used* one. The owner-facing verification sequence suggested after the first Batch 1 delivery included testing `--new-session` — which creates a real session row with zero messages. That empty session then became "latest," so the next plain `ciphlet chat` correctly reported "(resuming previous conversation)" while actually resuming the *empty* session, orphaning the real one. Reproduced exactly on Mac with a temporary SQLite DB before fixing.
+
+**Fix:** `latest_session_id()` now joins `messages` and orders by the messages table's own autoincrement id, so it only ever considers sessions that actually have at least one message — an empty session (from an exited `--new-session`, or otherwise) can no longer become what a later plain `ciphlet chat` resumes into. Only `ciphlet/memory/store.py` changed; `Session`/`_resolve_session`/`Orchestrator`/routing/`[brain]` reporting were not touched.
+
+**Status: IMPLEMENTED / CODE INSPECTED — Mac-reproduced and Mac-fix-verified (both the original failure and the fix, plus full regression re-run of the earlier continuity/`--new-session`/`--no-memory` checks) — PI VERIFICATION REQUIRED.** Not yet re-run on the actual Pi.
+
+**Update — this fix did not resolve the Pi failure.** The owner deployed it, confirmed a fresh process was running the repaired code, and recall still failed even though it correctly reported "resuming."
+
+## Pi failure #1, round 2 — recall still fails after the empty-session fix
+
+**What this round's evidence structurally proves:** the owner's report ("it still reports resuming") is only possible if `latest_session_id()` found a session with ≥1 real message — the round-1 fix makes that a hard precondition, not a coincidence. So the empty-session bug is confirmed *not* recurring; the DB genuinely has a resumable session with content.
+
+**What was tested this round (real production classes, not mocks, to avoid re-proving what round 1 already proved):**
+- A full simulated two-process run using the actual `MemoryStore` + `Session` + `_resolve_session` + `Orchestrator` classes together (only the brain provider itself stubbed, to capture exactly what `messages` it receives) — confirmed process 2 resumes the correct session and `Orchestrator.handle_text()` assembles and passes the *complete* prior conversation into the `generate()` call. This is the first time the full in-process pipeline (not just the memory layer alone) was exercised end-to-end.
+- Re-read all five concrete `BrainProvider.generate()` implementations (Groq, Gemini, OpenRouter, Claude, local) line by line — each rebuilds its message payload fresh from the `messages` argument on every call; none cache or drop history.
+- **Could not find or reproduce any further defect in the Session → SQLite → Orchestrator → provider-context path itself.** This path is now proven correct by direct execution of the real classes, not just read-through.
+
+**What was changed as a result:** since no further code defect could be located or reproduced, the responsible fix this round is diagnostic, not corrective — closing the "diagnose" loop instead of guessing again:
+- `MemoryStore.count_messages(session_id)` (new) and `Orchestrator.history_count()` (new) — ground-truth message counts.
+- `ciphlet chat`'s startup output now prints the actual `db_path` in use and, on resume, the actual prior message count — e.g. `(resuming previous conversation — 4 prior message(s))` — instead of an opaque, unverifiable claim.
+
+**Why this is the right next step, not another guess:** if the *next* Pi run still fails to recall, this output will immediately show which of two remaining explanations is true, without further speculation:
+1. The count is 0 or unexpectedly low → a genuine remaining data/path defect (something this session's testing didn't reach — e.g. a `CIPHLET_DB_PATH` / deployment-environment discrepancy between the two process launches, such as the app resolving a different database file than expected, or the on-disk `data/` directory being reset between runs by whatever deployment step copies the fix over).
+2. The count matches expectations (e.g. 4, from a real prior exchange) → the data pipeline is confirmed correct end-to-end, and the failure is downstream — most likely a specific real provider/model not making good use of otherwise-correct context, which would need the `[brain]` line from that exact failing turn to diagnose further.
+
+**Status: IMPLEMENTED / CODE INSPECTED — Mac-verified (including a corrected test-expectation bug caught and fixed in the no-memory count check during this round's testing) — PI VERIFICATION REQUIRED.** This is a diagnostic addition, not a confirmed fix for the underlying recall failure — see the two explanations above for what to check on the next Pi run.
+
+**Update — the diagnostic resolved explanation #2: "Resumed session reports 8 prior messages" and the failing turn was confirmed served by Groq.** This directly proves the data pipeline (Session → SQLite → Orchestrator) is correct end-to-end — the persisted history exists, was found, and was loaded. The remaining failure is downstream of storage: Groq is not making use of the context it was given.
+
+## Pi failure #1, round 3 — root cause: LLM disclaimer reflex, not a data-path bug
+
+**Diagnosis:** with the data path proven correct (8 real prior messages, correct session, correct provider), I traced the exact request construction: `Orchestrator.handle_text()` loads `history` (verified: includes all 8 prior + the new turn = 9 messages) and passes it to `active_brain.generate(history, system=build_system_prompt())`. Re-read all 5 providers' `generate()` implementations line-by-line — every one rebuilds its payload fresh from `messages` on each call, so the 9 messages were genuinely included in the real Groq API request. Reproduced this exact scenario on Mac (8 prior messages, simulated restart, "what did we discuss before restart?") using the real `Orchestrator`/`MemoryStore`/`_resolve_session` — confirmed the full 9-message history is correctly assembled.
+
+Given the data is proven present in the request, and the model's *reply text itself* was "no memory" (not an API/transport failure — `[brain]` correctly showed Groq served it), the most evidence-consistent explanation is a well-documented LLM behavior: models (open-weight ones especially) are prone to a **reflexive "I don't have memory across sessions" disclaimer** triggered by phrasing like "before restart" / "previous session" — regardless of whether the actual context window does contain that history. The model pattern-matches the question to a generic self-description about its architecture instead of checking the conversation actually provided to it.
+
+**Fix (prompt-level, not plumbing — the plumbing was already proven correct):** `ciphlet/learning/engine.py` — `build_system_prompt()` now takes `has_history: bool` (defaulting to `False`, so a genuinely fresh conversation is never told it has memory it doesn't) and, when true, appends an explicit `MEMORY_CONTINUITY_NOTE` instructing the model that the message history it was given — including turns from before a restart — is real available context, that it must answer recall questions from those actual prior messages, and that it must not claim to have no memory when prior turns are present. `ciphlet/orchestrator.py` passes `has_history=len(history) > 1`, derived from the actual loaded history each turn (never hardcoded), matching the same runtime-truth pattern already used for the identity fix.
+
+**Minimum additional runtime evidence added, per instruction:** `Orchestrator.last_context_size` (new) — the exact message count actually sent on the most recent successful call. `ciphlet chat`'s `[brain]` line now reads e.g. `[brain] groq (openai/gpt-oss-120b) — 9 message(s) in context`, so the *next* Pi test shows, on the exact failing turn, whether the count matches expectation (confirming the prompt fix should apply) without needing another diagnostic round.
+
+**Verified on Mac:** reproduced the exact Pi scenario (8 prior messages via a simulated restart, then "what did we discuss before restart?") with a capturing fake provider — confirmed `MEMORY_CONTINUITY_NOTE` is present in the system prompt for that turn, confirmed `last_context_size == 9`, confirmed a genuinely fresh first turn does *not* get the note (so honesty about no-memory conversations is preserved), and re-ran all prior regression checks (empty-session exclusion, `--new-session`, `--no-memory` exclusion, CLI parsing) — all still pass.
+
+**Status: IMPLEMENTED / CODE INSPECTED — Mac-reproduced against the exact reported scenario — PI VERIFICATION REQUIRED.** Cannot be verified further from here: the actual Groq API was never called (no network/API access from this Mac, by design) — this fix targets a *model behavior* pattern inferred from the evidence, not something provable without the real API. If recall still fails after this, the `[brain] ... — N message(s) in context` line on that exact turn is the next diagnostic checkpoint.
+
+---
+
+## Owner-supplied Pi evidence (historical, as reported by the owner)
+
+This is evidence *reported by the owner from actual Pi runs*, not re-derived or inferred here. Recorded verbatim in substance so later sessions don't have to re-litigate it:
+
+1. CIPHLET text conversation works on Raspberry Pi 5 (`ciphlet chat` runs and produces real replies).
+2. The strengthened runtime-identity fix (explicit "you are NOT GPT-4/ChatGPT/OpenAI" grounding, per-provider, per-call) was deployed and Pi-tested.
+3. A real AUTO-mode response was served by **Groq**.
+4. CIPHLET correctly identified itself as **Groq / `openai/gpt-oss-120b`**, and correctly stated Groq cloud hosting (not "hosted on the Raspberry Pi") — the earlier false GPT-4/ChatGPT identity behavior was corrected.
+5. The Pi's runtime `.env` sets `CIPHLET_GEMINI_MODEL=gemini-3.6-flash`.
+
+**Status: ALREADY PI VERIFIED** for items 1–4 above (as reported).
+
+Note on item 3/4: the model named (`openai/gpt-oss-120b`) is a Groq-hosted open-weight model, not an OpenAI-hosted one — consistent with Groq being reached first in the AUTO chain and correctly self-identifying as Groq rather than the model name's vendor prefix.
+
+Note on item 5: the shipped repository default for `CIPHLET_GEMINI_MODEL` is `gemini-2.5-flash` (`ciphlet/config.py`, `.env.example`) — `gemini-3.6-flash` is **not** the code default anywhere in this repo. Since `Config.load()` reads `CIPHLET_GEMINI_MODEL` from the environment and only falls back to the code default when unset, the Pi's `.env` override is exactly what actually gets used at runtime; the shipped default was left unchanged per instruction (preserve unless there's concrete evidence it's invalid). **Whether `gemini-3.6-flash` is actually valid/available under the configured Gemini account/key is PI/LIVE ACCOUNT VERIFICATION REQUIRED** — not inferred from code or docs.
+
+---
+
+## Batch 1 changes made this session (code-inspected only; not yet Pi-run)
+
+### 1. Cross-restart conversation continuity
+**Status: IMPLEMENTED / CODE INSPECTED — Mac-side logic-verified — first Pi attempt FAILED and was fixed (see "Pi failure #1" above) — PI RE-VERIFICATION REQUIRED**
+
+- `ciphlet/memory/store.py`: added `MemoryStore.latest_session_id()` — resumes the persisted (non-no-memory) session that most recently received an actual message. No schema change.
+- `ciphlet/session.py`: `Session` gained a `resumed: bool = False` field (informational only).
+- `ciphlet/main.py`: new `_resolve_session()` — by default, a fresh `ciphlet chat`/`ciphlet voice` invocation now resumes the most recent persisted session (so conversation history survives an app restart) instead of always minting a random session id. `--new-session` starts a scratch conversation instead; `--no-memory` continues to always start fresh and is never itself resumable.
+- Verified on Mac with a real (temporary) SQLite DB and the actual `MemoryStore`/`Session`/`_resolve_session` code (no mocks of the persistence layer). Initial version passed a basic restart test but missed the empty-session case, which the first real Pi run caught — see "Pi failure #1" above for the fix and its own Mac verification.
+- **Not yet re-run on the Pi since the fix.** Needs an actual `ciphlet chat` → exit → `ciphlet chat` cycle (and ideally the `--new-session`-then-recall sequence that caught the bug) on the real device to confirm end-to-end.
+
+### 2. `router.last_served` surfaced through normal runtime output
+**Status: IMPLEMENTED / CODE INSPECTED — Mac-side logic-verified — PI VERIFICATION REQUIRED**
+
+- `ciphlet/orchestrator.py`: `Orchestrator` now tracks `self.last_brain: str | None`, updated after every `handle_text()` call — set to `None` on a failed turn (nothing served it), otherwise set from the actual provider's identity (using `BrainRouter.last_served` when the active brain is the router, or the leaf provider's own `name`/`model` directly for `--premium`/`--local-only`).
+- `ciphlet/main.py`: `run_chat`'s REPL and `run_voice`'s PTT loop now print `[brain] <identity>` after each reply — e.g. `[brain] groq (openai/gpt-oss-120b)` — directly in normal CLI output, no debugger needed.
+- **Scope boundary respected:** `HandsFreeVoiceSession`'s internal loop (`voice/pipeline.py`) was deliberately left unchanged — wiring it in would mean changing the voice module's callback contract, and hands-free voice is unverified/hardware-untested regardless (out of this session's Batch 1 scope, which is brain/router/memory).
+- Verified on Mac with fake `BrainProvider` stand-ins exercising the real `Orchestrator`/`BrainRouter` code: confirmed `last_brain` correctly reflects (a) a mid-chain fallback (Groq fails → Gemini serves → reports Gemini), (b) LOCAL_ONLY mode (reports local directly, bypassing the router object entirely), and (c) total failure (resets to `None`, doesn't report stale/wrong identity).
+- **Not yet run on the Pi against the real providers.**
+
+---
+
+## What remains PI VERIFICATION REQUIRED (carried over from the Core Verification Gate)
+
+- Which provider actually serves a given AUTO-mode turn over time (now directly observable via the `[brain]` line — re-confirm with it visible).
+- LOCAL_ONLY mode end-to-end on the Pi (no network calls, Qwen responds).
+- Gemini and OpenRouter legs actually being reached/working (only Groq has been confirmed live so far).
+- Live free-tier reachability and account status for `gemini-3.6-flash` under the configured `GEMINI_API_KEY`.
+- The two Batch 1 fixes above, actually exercised on the Pi (restart continuity; `[brain]` line accuracy across a real fallback).
+
+## Known incomplete (not fixed this session, out of Batch 1's brain/router/memory scope or explicitly excluded)
+
+- Hands-free voice (`HandsFreeVoiceSession`) has no `[brain]` identity surfacing — see scope note above.
+- No mechanism to list or switch between multiple past sessions — continuity is "resume the one most recent conversation," not a session browser. This was the minimal fix matching "using the existing Session/SQLite architecture"; a multi-session UI would be a new feature, not a Batch 1 defect fix.
