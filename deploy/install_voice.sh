@@ -79,16 +79,18 @@ echo "(Optional accuracy upgrade later: vosk-model-en-us-0.22-lgraph, ~128MB,"
 echo " from the same alphacephei.com/vosk/models page — larger/slower than"
 echo " the small model above; not needed for functional testing.)"
 
-# --- 5. openWakeWord: generic pretrained wake models ---
-# No custom "Hey Ciphlet" model exists yet (that requires training a new
-# model — out of scope here). This downloads openWakeWord's bundled
-# generic pretrained models (e.g. "hey_jarvis", "alexa") so the hands-free
-# pipeline itself (wake -> VAD -> STT -> brain -> TTS -> barge-in) can be
-# exercised end-to-end on real hardware now, using one of those phrases
-# instead of "Hey Ciphlet" until a custom model is trained.
+# --- 5. openWakeWord: generic pretrained wake models (fallback) ---
+# Always fetched, even if a custom model (below) is already trained, since
+# it's the harmless, always-useful fallback and costs little to have.
 echo
 echo "-- Fetching openWakeWord pretrained models --"
 python3 -c "import openwakeword.utils as u; u.download_models()"
+
+# --- 6. Custom "Hey Ciphlet" wake model, if already trained ---
+# Training happens off-Pi (GPU-class job) — see deploy/wake_word/TRAINING.md.
+# This just checks whether the trained file has already been placed here.
+WAKE_MODEL="$MODELS_DIR/wake/hey_ciphlet.onnx"
+mkdir -p "$MODELS_DIR/wake"
 
 echo
 echo "== Voice runtime setup complete =="
@@ -96,9 +98,22 @@ echo
 echo "Add these to your .env (or edit the existing blank entries):"
 echo "  CIPHLET_PIPER_MODEL=$PIPER_ONNX"
 echo "  CIPHLET_VOSK_MODEL_PATH=$VOSK_DIR"
-echo "  # CIPHLET_WAKE_MODEL left unset on purpose: no trained \"Hey Ciphlet\""
-echo "  # model exists yet, so openWakeWord's default generic pretrained"
-echo "  # models load instead (test with \"hey jarvis\" / \"alexa\" for now)."
+if [ -f "$WAKE_MODEL" ]; then
+    echo "  CIPHLET_WAKE_MODEL=$WAKE_MODEL"
+    echo "  # Custom \"Hey Ciphlet\" model found and wired in."
+else
+    echo "  # CIPHLET_WAKE_MODEL left unset: no trained \"Hey Ciphlet\" model at"
+    echo "  # $WAKE_MODEL yet, so openWakeWord's generic pretrained"
+    echo "  # models load instead (test with \"hey jarvis\" / \"alexa\" for now)."
+    echo "  # To train a real \"Hey Ciphlet\" model: see deploy/wake_word/TRAINING.md"
+    echo "  # (it's a GPU-class job — run on Colab, not here — then place the"
+    echo "  # resulting file at $WAKE_MODEL and re-run this script)."
+fi
+echo
+echo "Mic/speaker device selection (only needed if the Pi's default audio"
+echo "device isn't the mic/speaker you want to use):"
+echo "  CIPHLET_AUDIO_INPUT_DEVICE=   # list mics: python3 -m sounddevice"
+echo "  CIPHLET_AUDIO_OUTPUT_DEVICE=  # list speakers: aplay -L"
 echo
 echo "Test push-to-talk (simplest bring-up path, §24 Stage 1-2):"
 echo "  source .venv/bin/activate && ciphlet voice --ptt"

@@ -41,7 +41,12 @@ class WebRTCVadAudioProcessor(AudioProcessor):
                 raise VoiceUnavailableError(
                     "'webrtcvad' is not installed. Install Ciphlet's voice extras on the Pi."
                 ) from exc
-            self._vad = webrtcvad.Vad(self._aggressiveness)
+            try:
+                self._vad = webrtcvad.Vad(self._aggressiveness)
+            except Exception as exc:
+                raise VoiceUnavailableError(
+                    f"Failed to initialize WebRTC VAD (aggressiveness={self._aggressiveness}): {exc}"
+                ) from exc
         return self._vad
 
     def condition(self, audio: bytes) -> bytes:
@@ -74,7 +79,15 @@ class OpenWakeWordProvider(WakeProvider):
                     "'openwakeword' is not installed. Install Ciphlet's voice extras on the Pi."
                 ) from exc
             kwargs = {"wakeword_models": [self._model_path]} if self._model_path else {}
-            self._model = Model(**kwargs)
+            try:
+                self._model = Model(**kwargs)
+            except Exception as exc:
+                where = f" from '{self._model_path}'" if self._model_path else " (bundled pretrained models)"
+                raise VoiceUnavailableError(
+                    f"Failed to load openWakeWord model{where}: {exc}. If using the bundled "
+                    "pretrained models, run: python3 -c \"import openwakeword.utils as u; u.download_models()\". "
+                    "If using CIPHLET_WAKE_MODEL, check the path is a valid .onnx/.tflite model file."
+                ) from exc
         return self._model
 
     def detect(self, audio_chunk: bytes) -> bool:
@@ -109,7 +122,13 @@ class VoskSTT(STTProvider):
                 raise VoiceUnavailableError(
                     "'vosk' is not installed. Install Ciphlet's voice extras on the Pi."
                 ) from exc
-            self._model = Model(self._model_path)
+            try:
+                self._model = Model(self._model_path)
+            except Exception as exc:
+                raise VoiceUnavailableError(
+                    f"Failed to load VOSK model at '{self._model_path}': {exc}. Check CIPHLET_VOSK_MODEL_PATH "
+                    "points at an unzipped VOSK model directory (see deploy/install_voice.sh)."
+                ) from exc
         return self._model
 
     def transcribe(self, audio: bytes) -> str:
@@ -137,12 +156,16 @@ class PiperTTS(TTSProvider):
         sample_rate: int = 22050,
         piper_bin: str = "piper",
         player_bin: str = "aplay",
+        output_device: str | None = None,
     ) -> None:
         self._model_path = model_path
         self._sample_rate = sample_rate
         self._piper_bin = piper_bin
         self._player_bin = player_bin
+        self._output_device = output_device
+        self._piper_proc: subprocess.Popen | None = None
         self._player_proc: subprocess.Popen | None = None
+        self._stopped = False
 
     def speak(self, text: str) -> None:
         if shutil.which(self._piper_bin) is None:
@@ -150,25 +173,54 @@ class PiperTTS(TTSProvider):
         if shutil.which(self._player_bin) is None:
             raise VoiceUnavailableError(f"'{self._player_bin}' binary not found on PATH.")
 
+        player_cmd = [self._player_bin, "-q"]
+        if self._output_device:
+            player_cmd += ["-D", self._output_device]
+        player_cmd += ["-r", str(self._sample_rate), "-f", "S16_LE", "-t", "raw", "-"]
+
+        self._stopped = False
         piper = subprocess.Popen(
             [self._piper_bin, "--model", self._model_path, "--output-raw"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        player = subprocess.Popen(
-            [self._player_bin, "-q", "-r", str(self._sample_rate), "-f", "S16_LE", "-t", "raw", "-"],
-            stdin=piper.stdout,
-        )
+        self._piper_proc = piper
+        player = subprocess.Popen(player_cmd, stdin=piper.stdout, stderr=subprocess.PIPE)
         self._player_proc = player
+        assert piper.stdout is not None
+        piper.stdout.close()  # let piper see SIGPIPE if player exits early (barge-in stop())
+
         try:
             assert piper.stdin is not None
             piper.stdin.write(text.encode("utf-8"))
             piper.stdin.close()
-            player.wait()
+            _, player_err = player.communicate()
+            piper_err = piper.stderr.read() if piper.stderr else b""
+            piper.wait()
         finally:
+            self._piper_proc = None
             self._player_proc = None
 
+        if self._stopped:
+            return  # intentional barge-in interruption (§4.6), not a failure
+
+        if piper.returncode != 0:
+            raise VoiceUnavailableError(
+                f"Piper synthesis failed (exit {piper.returncode}): {piper_err.decode(errors='replace').strip()}"
+            )
+        if player.returncode != 0:
+            raise VoiceUnavailableError(
+                f"Audio playback failed (exit {player.returncode}): {player_err.decode(errors='replace').strip()}"
+            )
+
     def stop(self) -> None:
+        # True barge-in (§4.6): kill both the player and the (possibly
+        # still-synthesizing) piper process, not just playback — otherwise a
+        # repeatedly-interrupted piper process can pile up/hang on a full
+        # stdout pipe with no reader.
+        self._stopped = True
         if self._player_proc is not None:
             self._player_proc.terminate()
-            self._player_proc = None
+        if self._piper_proc is not None:
+            self._piper_proc.terminate()

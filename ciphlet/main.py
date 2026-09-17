@@ -189,20 +189,34 @@ def run_voice(args: argparse.Namespace) -> None:
         return run_chat(args)
 
     stt = VoskSTT(model_path=config.vosk_model_path)
-    tts = PiperTTS(model_path=config.piper_model_path)
+    tts = PiperTTS(model_path=config.piper_model_path, output_device=config.audio_output_device)
+
+    def _print_brain_info(_reply: str) -> None:
+        if orchestrator.last_brain:
+            info = f"[brain] {orchestrator.last_brain} — {orchestrator.last_context_size} message(s) in context"
+            if orchestrator.last_timing:
+                info += f" — {orchestrator.last_timing}"
+            print(info)
 
     try:
         if args.hands_free:
             audio = WebRTCVadAudioProcessor()
             wake = OpenWakeWordProvider(model_path=config.wake_model_path)
-            session = HandsFreeVoiceSession(audio, wake, stt, tts, orchestrator.handle_text)
+            session = HandsFreeVoiceSession(
+                audio,
+                wake,
+                stt,
+                tts,
+                orchestrator.handle_text,
+                input_device=config.audio_input_device,
+                on_reply=_print_brain_info,
+            )
             session.run_forever()
         else:
-            session = PTTVoiceSession(stt, tts, orchestrator.handle_text)
+            session = PTTVoiceSession(stt, tts, orchestrator.handle_text, input_device=config.audio_input_device)
             while True:
                 session.run_turn()
-                if orchestrator.last_brain:
-                    print(f"[brain] {orchestrator.last_brain}")
+                _print_brain_info("")
     except VoiceUnavailableError as exc:
         print(f"Voice unavailable ({exc}). Falling back to text mode.", file=sys.stderr)
         run_chat(args)

@@ -70,6 +70,13 @@ class Config:
     wake_model_path: str | None
     piper_model_path: str | None
     vosk_model_path: str | None
+    # Mic (PortAudio, via sounddevice) and speaker (ALSA, via `aplay`) device
+    # selection — the Pi's default audio device is not always the intended
+    # mic/speaker (e.g. a USB mic or HAT). Either an index or a name
+    # (sub)string; list real devices with `python3 -m sounddevice` (mic) or
+    # `aplay -L` (speaker). Unset uses each subsystem's own default.
+    audio_input_device: str | int | None
+    audio_output_device: str | None
 
     @classmethod
     def load(cls) -> "Config":
@@ -94,4 +101,13 @@ class Config:
             wake_model_path=os.environ.get("CIPHLET_WAKE_MODEL"),
             piper_model_path=os.environ.get("CIPHLET_PIPER_MODEL"),
             vosk_model_path=os.environ.get("CIPHLET_VOSK_MODEL_PATH"),
+            audio_input_device=_parse_audio_device(os.environ.get("CIPHLET_AUDIO_INPUT_DEVICE")),
+            audio_output_device=os.environ.get("CIPHLET_AUDIO_OUTPUT_DEVICE") or None,
         )
+
+
+def _parse_audio_device(raw: str | None) -> str | int | None:
+    if not raw:
+        return None
+    raw = raw.strip()
+    return int(raw) if raw.lstrip("-").isdigit() else raw
