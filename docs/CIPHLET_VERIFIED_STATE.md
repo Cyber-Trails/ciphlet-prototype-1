@@ -27,6 +27,19 @@ This section is the authoritative current state for the local brain. Everything 
 
 ---
 
+## Voice runtime completion — installer + TEMPORARY test voice assignment
+
+**Status: IMPLEMENTED / CODE INSPECTED — PI VERIFICATION REQUIRED.** No part of this has been run on the actual Pi yet; nothing here should be treated as working until `deploy/install_voice.sh`, then `ciphlet voice --ptt` and `ciphlet voice --hands-free`, have actually been observed producing real audio in/out on the device.
+
+- Researched several lightweight English Piper voices (verified against Hugging Face model cards, not assumed) split into youthful-leaning male/female candidates, and presented them to the owner rather than silently picking one — see conversation record; Piper does not document any voice by perceived age, so no age claim is made for any candidate.
+- Owner selected **`en_US-amy-medium`** as the **TEMPORARY** voice for Pi functional testing only. This is explicitly **not** Ciphlet's permanent voice identity — TTS remains swappable behind `ciphlet/voice/base.py::TTSProvider`, unchanged by this work, so a different/better local TTS engine can be evaluated later without touching the orchestrator or pipeline.
+- No code changes were needed to `ciphlet/voice/providers.py::PiperTTS` — verified (via the `piper-tts` PyPI package's own docs, not assumed) that its CLI already matches what was implemented: `piper --model <path> --output-raw`, text via stdin, raw PCM piped to `aplay`. Also verified `en_US-amy-medium`'s own `onnx.json` reports `sample_rate: 22050`, matching `PiperTTS`'s existing default — no sample-rate mismatch.
+- Verified `piper-tts` ships aarch64 Linux wheels (bundling onnxruntime + espeak-ng), so no Pi-specific native build step is required beyond the existing `pip install -e '.[voice]'` path.
+- Added `deploy/install_voice.sh` — a new, separate, idempotent script (run after `deploy/install_pi.sh`) that installs the voice extras and downloads the actual model files each provider needs, none of which are bundled by the pip packages themselves: `en_US-amy-medium.onnx`/`.onnx.json` (Piper, from the `rhasspy/piper-voices` Hugging Face repo), `vosk-model-small-en-us-0.15` (VOSK, from alphacephei.com), and openWakeWord's bundled generic pretrained models (via `openwakeword.utils.download_models()`). Prints the exact `.env` lines to set afterward. `.env.example` updated to match, with `models/` added to `.gitignore` (large binaries, not committed).
+- **Known, explicit, documented gap — not a bug**: no custom "Hey Ciphlet" openWakeWord model exists yet; training one is out of scope here. `CIPHLET_WAKE_MODEL` is left unset so openWakeWord's generic pretrained models (e.g. "hey jarvis", "alexa") load instead, so the full hands-free pipeline mechanics (wake → VAD → STT → brain → TTS → barge-in) can still be exercised end-to-end on real hardware now, using one of those phrases in place of "Hey Ciphlet" until a custom model is trained later.
+
+---
+
 ## Clean Rebuild / Adopt-Adapt — local intelligence + voice pipeline replaced
 
 **Everything below this section (the three `local_provider.py`/llama-cli rounds) describes a superseded approach.** The per-request `llama-cli` subprocess local brain was abandoned after being implemented, deployed, and proven unusable on the Pi across three repair rounds (context/timeout hang, then a build-incompatible `-no-cnv` flag) — kept below only as historical record of what was tried and why it didn't work, not as current state.

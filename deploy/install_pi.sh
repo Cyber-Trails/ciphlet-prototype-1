@@ -92,9 +92,9 @@ echo "  ollama pull qwen3:4b-instruct-q4_K_M"
 echo "  # then set CIPHLET_OLLAMA_MODEL=qwen3:4b-instruct-q4_K_M in .env"
 echo
 echo "Optional: for voice (mic/speaker), also run:"
-echo "  source .venv/bin/activate && pip install -e '.[voice]'"
-echo "  # then download a VOSK STT model and a Piper voice model, and set"
-echo "  # CIPHLET_VOSK_MODEL_PATH / CIPHLET_PIPER_MODEL in .env"
+echo "  bash deploy/install_voice.sh"
+echo "  # installs voice extras + downloads the Piper/VOSK/openWakeWord"
+echo "  # model files and prints the .env lines to set."
 echo
 echo "Start Ciphlet:"
 echo "  source .venv/bin/activate && ciphlet chat"
