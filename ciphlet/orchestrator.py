@@ -31,12 +31,16 @@ class Orchestrator:
         session: Session,
         embodiment: EmbodimentSink | None = None,
         local_brain: BrainProvider | None = None,
+        system_note: str | None = None,
     ) -> None:
         self._brain = brain  # AUTO mode: free-provider chain (+Claude if --premium)
         self._local_brain = local_brain  # LOCAL_ONLY mode: Qwen directly, bypassing everything above
         self._memory = memory
         self._session = session
         self._embodiment = embodiment or EmbodimentSink()
+        # Optional channel context appended to the system prompt (e.g. "you are speaking aloud on a
+        # live voice box"). None for text chat, so text behaviour is exactly as before.
+        self._system_note = system_note
         self._memory.start_session(session.id, no_memory=session.no_memory)
         # In-process only, for no-memory sessions (§5.3): keeps normal
         # in-session continuity without ever touching SQLite.
@@ -123,6 +127,8 @@ class Orchestrator:
             # for this call), never assumed — an empty/fresh conversation
             # must not be told it has memory it doesn't (§ learning/engine.py).
             system = build_system_prompt(has_history=len(history) > 1)
+            if self._system_note:
+                system = system + "\n\n" + self._system_note
             reply_text = active_brain.generate(history, system=system, on_token=on_token)
         except BrainUnavailableError as exc:
             self._embodiment.set_state(EmbodimentState.WARNING)

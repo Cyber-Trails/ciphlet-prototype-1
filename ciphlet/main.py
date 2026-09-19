@@ -65,6 +65,7 @@ def _build_orchestrator(
     premium: bool = False,
     local_only: bool = False,
     new_session: bool = False,
+    system_note: str | None = None,
 ) -> Orchestrator:
     local = OllamaBrainProvider(
         host=config.ollama_host,
@@ -97,6 +98,7 @@ def _build_orchestrator(
         memory=memory,
         session=session,
         embodiment=EmbodimentSink(),
+        system_note=system_note,
     )
 
 
@@ -184,12 +186,15 @@ def run_voice(args: argparse.Namespace) -> None:
         from ciphlet.voice.selftest import run_selftest
 
         sys.exit(run_selftest(config))
+    from ciphlet.voice.context import VOICE_SYSTEM_NOTE
+
     orchestrator = _build_orchestrator(
         config,
         no_memory=args.no_memory,
         premium=args.premium,
         local_only=args.local_only,
         new_session=args.new_session,
+        system_note=VOICE_SYSTEM_NOTE,  # the brain must know it is speaking aloud on a live voice box
     )
 
     from ciphlet.voice.pipeline import HandsFreeVoiceSession, PTTVoiceSession

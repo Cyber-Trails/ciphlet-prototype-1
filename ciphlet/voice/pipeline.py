@@ -15,9 +15,11 @@ message and the caller (main.py) falls back to text mode rather than crashing.
 
 from __future__ import annotations
 
+import queue
 import re
 import sys
 import threading
+import time
 import unicodedata
 from collections import deque
 from math import gcd
@@ -33,11 +35,17 @@ SAMPLE_RATE = 16000
 FRAME_MS = 30
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000  # 480 samples/frame — valid webrtcvad frame size
 SILENCE_FRAMES_TO_STOP = 20  # ~600ms of silence ends an utterance
-NO_SPEECH_TIMEOUT_FRAMES = 200  # ~6s: give up if nothing is said after the wake word
+NO_SPEECH_TIMEOUT_FRAMES = 133  # ~4s: give up if nothing is said after the wake word (each false wake costs this much deaf time)
 MAX_UTTERANCE_FRAMES = 500  # ~15s hard cap on one utterance
 POST_SPEECH_HOLDOFF_FRAMES = 15  # ~450ms of mic ignored after TTS ends, so room echo can't re-trigger wake
 WAKE_TAIL_SETTLE_FRAMES = 5  # ~150ms of silence = the wake phrase itself has ended
 WAKE_TAIL_MAX_FRAMES = 40  # ~1.2s: if speech never pauses, the user is talking straight on into their request
+# Nothing in the mic loop may depend on how long a provider takes: the listener never runs STT or the
+# brain, and a reply that never finishes playing cannot hold it in "speaking" forever.
+THINKING_NOTICE_S = 8.0  # print "(still thinking…)" if the brain takes longer than this
+SPEECH_TIMEOUT_MIN_S = 20.0  # a reply may not hold the speaking state longer than max(this, chars/SPEECH_CHARS_PER_S + 10)
+SPEECH_CHARS_PER_S = 8.0
+SPEECH_SLACK_S = 10.0
 SPOKEN_MAX_CHARS = 600  # ~40 s of speech; a longer reply is spoken in part and shown in full on screen
 ECHO_MIN_WORDS = 3  # a shorter transcript is never treated as Ciphlet hearing itself
 ECHO_OVERLAP = 0.8  # fraction of transcript words found in Ciphlet's last reply => it heard itself
@@ -448,6 +456,9 @@ class HandsFreeVoiceSession:
         barge_in_warmup_frames: int = BARGE_IN_WARMUP_FRAMES,
         spoken_max_chars: int = SPOKEN_MAX_CHARS,
         barge_in_low_level: float = BARGE_IN_LOW_LEVEL,
+        speech_timeout_min_s: float = SPEECH_TIMEOUT_MIN_S,
+        thinking_notice_s: float = THINKING_NOTICE_S,
+        speech_slack_s: float = SPEECH_SLACK_S,
     ) -> None:
         self._audio = audio
         self._wake = wake
@@ -469,6 +480,21 @@ class HandsFreeVoiceSession:
         self._last_reply = ""
         self._wake_label = wake_label
         self._spoken_max_chars = spoken_max_chars
+        # --- listener / turn-worker split -------------------------------------------------
+        # The listener (run_forever's mic loop) only reads the mic, detects the wake word,
+        # captures, and detects barge-in. Everything slow (STT, the brain, starting speech) is done
+        # by the turn worker, so the assistant is back in standby the moment a capture ends.
+        self._turns: queue.Queue = queue.Queue()
+        self._seq = 0  # sequence number of the newest captured turn
+        self._capturing = threading.Event()  # listener is recording an utterance
+        self._pending = 0  # turns submitted and not yet fully handled (queued, or in STT/brain/speech start)
+        self._pending_lock = threading.Lock()
+        self._speech_deadline = 0.0  # monotonic time by which the current reply must finish; 0 = none
+        self._speech_timeout_min_s = speech_timeout_min_s
+        self._speech_slack_s = speech_slack_s
+        self._thinking_notice_s = thinking_notice_s
+        self._worker: threading.Thread | None = None
+        self._stopping = threading.Event()
 
     def _check_wake(self, conditioned: bytes) -> bool:
         """Accumulate VAD-sized frames into openWakeWord-sized windows
@@ -494,11 +520,15 @@ class HandsFreeVoiceSession:
         # loop for seconds on its first window, and audio in that gap is lost.
         self._wake.load()
         self._stt.load()
+        self._stopping.clear()
+        self._worker = threading.Thread(target=self._work, name="turn-worker", daemon=True)
+        self._worker.start()
         print(f"Ciphlet is listening for {self._wake_label}... (Ctrl+C to stop)")
         stream = _open_input_stream(self._input_device)
         recent: deque = deque(maxlen=max(self._barge_in_frames, 1))  # those frames, kept so the interruption isn't clipped
         was_speaking = False
         holdoff = 0
+        announce_standby = False
         try:
             while True:
                 chunk, _ = stream.read(FRAME_SAMPLES)
@@ -508,6 +538,13 @@ class HandsFreeVoiceSession:
                     if not was_speaking:
                         self._barge.reset()  # a new reply just started: relearn the echo level
                     was_speaking = True
+                    if self._speech_deadline and time.monotonic() > self._speech_deadline:
+                        # The reply never finished playing (a stuck player must not leave Ciphlet deaf).
+                        print("(speech timed out — back to listening)", file=sys.stderr)
+                        self._tts.stop()
+                        self._speaking.clear()
+                        self._speech_deadline = 0.0
+                        continue
                     # Interruption path (§4.6): listen while Ciphlet talks and
                     # barge in on sustained speech that is clearly louder than
                     # the echo of Ciphlet's own voice (see BargeInDetector; no
@@ -518,27 +555,149 @@ class HandsFreeVoiceSession:
                         print("(interrupted — listening)")
                         self._tts.stop()
                         self._speaking.clear()
-                        self._respond(self._capture_utterance(stream, list(recent)), echo_guard=True)
+                        self._speech_deadline = 0.0
+                        self._submit(self._capture_utterance(stream, list(recent)), echo_guard=True)
                         recent.clear()
                         was_speaking = False
+                        announce_standby = True
                         self._reset_wake()
                     continue
 
                 if was_speaking:  # playback just finished on its own
                     was_speaking = False
                     holdoff = POST_SPEECH_HOLDOFF_FRAMES
+                    announce_standby = True
                     self._reset_wake()
                 if holdoff > 0:
                     holdoff -= 1
                     continue
+                if announce_standby:
+                    announce_standby = False
+                    print(f"(standby — say {self._wake_label})")
 
                 if self._check_wake(conditioned):
                     print("(wake word detected)")
-                    self._respond(self._capture_utterance(stream, after_wake=True))
+                    self._submit(self._capture_utterance(stream, after_wake=True))
                     self._reset_wake()
         finally:
+            self._stopping.set()
+            self._turns.put(None)  # tell the worker to finish up
             stream.stop()
             stream.close()
+
+    # ---- turn worker ---------------------------------------------------------------------
+
+    def _submit(self, audio: bytes, echo_guard: bool = False) -> None:
+        """Hand a captured utterance to the worker and return to standby immediately."""
+        if not audio:
+            print("(heard nothing — no speech after the wake word)")
+            return
+        self._seq += 1
+        with self._pending_lock:
+            self._pending += 1
+        self._turns.put((self._seq, audio, echo_guard, None))
+
+    def _turn_done(self) -> None:
+        with self._pending_lock:
+            self._pending -= 1
+
+    def wait_idle(self, timeout: float = 10.0) -> bool:
+        """Block until every submitted turn has been fully handled (used by tests and clean shutdown)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._pending_lock:
+                if self._pending <= 0:
+                    return True
+            time.sleep(0.01)
+        return False
+
+    def _work(self) -> None:
+        while True:
+            item = self._turns.get()
+            if item is None:  # the stop sentinel: only ever the last thing in the queue, so nothing queued before it is lost
+                return
+            while item is not None:
+                finished = item
+                try:
+                    item = self._process(*finished)  # returns a newer, already-transcribed request, or None
+                except Exception as exc:  # noqa: BLE001 — a failed turn must never stop the assistant listening
+                    print(f"(that turn failed: {exc}) — still listening", file=sys.stderr)
+                    item = None
+                finally:
+                    self._turn_done()
+
+    def _transcribe(self, audio: bytes, echo_guard: bool) -> str:
+        """STT plus the two 'that was not a request' filters. Returns "" if there is nothing to answer."""
+        text = self._stt.transcribe(audio)
+        if not text:
+            print("(heard nothing I could make out)")
+            return ""
+        if echo_guard and _is_self_echo(text, self._last_reply):
+            print("(ignored — that was my own voice coming back in through the mic)")
+            return ""
+        return text
+
+    def _newer_request(self) -> tuple | None:
+        """A request that arrived while the previous one was in the brain, but only if it actually
+        contains words: a false wake that STT hears as nothing must not cancel a good reply."""
+        while True:
+            try:
+                item = self._turns.get_nowait()
+            except queue.Empty:
+                return None
+            if item is None:  # shutdown sentinel: leave it for the worker loop
+                self._turns.put(None)
+                return None
+            seq, audio, echo_guard, _ = item
+            try:
+                text = self._transcribe(audio, echo_guard)
+            except Exception:
+                self._turn_done()
+                raise
+            if text:
+                return (seq, audio, echo_guard, text)  # handled (and counted done) by the worker loop
+            self._turn_done()  # heard nothing: this turn is finished
+
+    def _process(self, seq: int, audio: bytes, echo_guard: bool, text: str | None = None):
+        t_stt = 0.0
+        if text is None:
+            t0 = time.monotonic()
+            text = self._transcribe(audio, echo_guard)
+            t_stt = time.monotonic() - t0
+            if not text:
+                return None
+
+        print(f"You: {text}")
+        notice = threading.Timer(self._thinking_notice_s, lambda: print("(still thinking…)"))
+        notice.daemon = True
+        notice.start()
+        t1 = time.monotonic()
+        try:
+            reply = self._on_utterance(text)
+        finally:
+            notice.cancel()
+        t_brain = time.monotonic() - t1
+        print(f"Ciphlet: {reply}")
+        if self._on_reply:
+            self._on_reply(reply)
+
+        # Don't start talking into a request the user is in the middle of making.
+        waited = 0.0
+        while self._capturing.is_set() and waited < 10.0:
+            time.sleep(0.05)
+            waited += 0.05
+        newer = self._newer_request()
+        if newer is not None:
+            print("(superseded by a newer request — not speaking this reply)")
+            return newer
+
+        spoken = speakable(reply, self._spoken_max_chars)
+        self._last_reply = spoken  # what was actually said (so hearing it back is recognised as echo)
+        print(f"[timing] stt {t_stt:.1f}s | brain {t_brain:.1f}s | speaking {len(spoken)} chars")
+        self._speech_deadline = time.monotonic() + max(self._speech_timeout_min_s, len(spoken) / SPEECH_CHARS_PER_S + self._speech_slack_s)
+        self._speaking.set()
+        threading.Thread(target=self._speak_then_clear, args=(spoken,), daemon=True).start()
+        return None
 
     def _capture_utterance(self, stream, prefix: list | None = None, after_wake: bool = False) -> bytes:
         """Record until ~600ms of silence *after speech has started*. Waits up to
@@ -550,6 +709,13 @@ class HandsFreeVoiceSession:
         the capture with nothing in it. So first let the wake phrase finish (a
         short silence) and drop it; if the user never pauses, keep it all — they
         are talking straight on into the request."""
+        self._capturing.set()
+        try:
+            return self._capture_frames(stream, prefix, after_wake)
+        finally:
+            self._capturing.clear()
+
+    def _capture_frames(self, stream, prefix: list | None, after_wake: bool) -> bytes:
         import numpy as np
 
         frames = list(prefix or [])
@@ -586,33 +752,13 @@ class HandsFreeVoiceSession:
                     return b""  # never started talking
         return np.concatenate(frames, axis=0).tobytes() if frames else b""
 
-    def _respond(self, audio: bytes, echo_guard: bool = False) -> None:
-        if not audio:
-            print("(heard nothing — no speech after the wake word)")
-            return
-        text = self._stt.transcribe(audio)
-        if not text:
-            print("(heard nothing I could make out)")
-            return
-        if echo_guard and _is_self_echo(text, self._last_reply):
-            print("(ignored — that was my own voice coming back in through the mic)")
-            return
-
-        print(f"You: {text}")
-        reply = self._on_utterance(text)
-        spoken = speakable(reply, self._spoken_max_chars)
-        self._last_reply = spoken  # what was actually said (so hearing it back is recognised as echo)
-        print(f"Ciphlet: {reply}")
-        if self._on_reply:
-            self._on_reply(reply)
-
-        self._speaking.set()
-        threading.Thread(target=self._speak_then_clear, args=(spoken,), daemon=True).start()
-
     def _speak_then_clear(self, reply: str) -> None:
+        started = time.monotonic()
         try:
             self._tts.speak(reply)
         except Exception as exc:  # runs in a thread: surface it instead of dying silently
             print(f"(speech output failed: {exc})", file=sys.stderr)
         finally:
             self._speaking.clear()
+            self._speech_deadline = 0.0
+            print(f"[timing] spoke for {time.monotonic() - started:.1f}s")

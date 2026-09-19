@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -76,7 +77,9 @@ class FakeWake(WakeProvider):
 
     def detect(self, chunk):
         self.windows += 1
-        return bool(np.frombuffer(chunk, dtype=np.int16)[0] == WAKE)
+        # content-based like the real engines: the window CONTAINS wake-phrase frames (windows are 1280
+        # samples, frames 480, so after a reply they are not aligned to frame boundaries)
+        return int((np.frombuffer(chunk, dtype=np.int16) == WAKE).sum()) >= 200
 
     def reset(self):
         self.resets += 1
@@ -111,6 +114,19 @@ class FakeTTS(TTSProvider):
         self._stop.set()
 
 
+class PacedTTS(FakeTTS):
+    """speak() takes a little real time, like a real reply does."""
+
+    def __init__(self, seconds):
+        super().__init__(block=False)
+        self.seconds = seconds
+
+    def speak(self, text):
+        self.spoken.append(text)
+        self.started.set()
+        time.sleep(self.seconds)
+
+
 def make_session(stt, tts, wake=None, replies=None, **kw):
     kw.setdefault("barge_in_warmup_frames", 0)  # the gate is exercised by its own tests below
     replies = replies if replies is not None else []
@@ -132,6 +148,7 @@ def run(session, script, on_read=None):
             session.run_forever()
         except KeyboardInterrupt:
             pass
+        session.wait_idle(5)
     return stream, out.getvalue(), err.getvalue()
 
 
@@ -326,6 +343,187 @@ class LowBandDetectorTests(unittest.TestCase):
         self.assertTrue(any(self.feed(det, [(True, 1500.0, 5.0)] * 4)))  # loud, no bass: the gate still catches it
 
 
+@unittest.skipIf(np is None, "numpy not installed")
+class StandbyContinuityTests(unittest.TestCase):
+    """Real Pi finding: STT and the brain ran INLINE in the mic loop, so while a provider was slow
+    (router timeouts are 60 s per provider) nothing was listening, and a turn that raised ended the
+    loop (falling back to text mode). The listener must stay in standby whatever the brain does."""
+
+    ASK = [WAKE] * 3 + [SIL] * 6 + [SPK] * 8 + [SIL] * 25  # one full "Hey Ciphlet ... question" capture
+
+    def session(self, brain, stt=None, tts=None, **kw):
+        stt = stt or FakeSTT(*(["a question"] * 10))
+        tts = tts or PacedTTS(0.1)
+        kw.setdefault("barge_in_warmup_frames", 0)
+        s = pipeline.HandsFreeVoiceSession(FakeAudio(), FakeWake(), stt, tts, brain, **kw)
+        return s, tts
+
+    def drive(self, session, script, on_read=None):
+        def paced(i):
+            time.sleep(0.003)  # real frames arrive every 30 ms; without any delay the script ends before the worker runs
+            if on_read:
+                on_read(i)
+
+        stream = ScriptedStream(script, paced)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(pipeline, "_open_input_stream", return_value=stream), redirect_stdout(out), redirect_stderr(err):
+            try:
+                session.run_forever()
+            except KeyboardInterrupt:
+                pass
+            session.wait_idle(10)
+        return stream, out.getvalue(), err.getvalue()
+
+    def test_the_mic_keeps_being_read_while_the_brain_is_still_thinking(self):
+        release = threading.Event()
+        in_brain = threading.Event()
+
+        def slow_brain(text):
+            in_brain.set()
+            release.wait(10)  # a provider that takes "forever"
+            return "late answer"
+
+        session, tts = self.session(slow_brain)
+        reads_while_thinking = []
+        stream_ref = {}
+
+        def on_read(i):
+            # after the request was captured and the brain started, keep counting mic reads
+            if in_brain.is_set() and not release.is_set():
+                reads_while_thinking.append(i)
+                if len(reads_while_thinking) >= 60:
+                    release.set()  # let the brain finish only after the listener kept going 60 frames
+
+        self.drive(session, self.ASK + [SIL] * 80, on_read)
+        release.set()
+        self.assertGreaterEqual(len(reads_while_thinking), 60)  # the listener never stopped reading the mic
+
+    def test_a_wake_word_during_thinking_is_heard_and_the_newer_request_wins(self):
+        gate = threading.Event()
+        replies = {"first question": "first answer", "second question": "second answer"}
+
+        def brain(text):
+            if text == "first question":
+                gate.wait(10)  # still thinking when the user says "Hey Ciphlet" again
+            return replies[text]
+
+        session, tts = self.session(brain, stt=FakeSTT("first question", "second question"))
+        seen = []
+
+        def on_read(i):
+            seen.append(i)
+            if i == len(self.ASK) + len(self.ASK) - 3:  # the second capture has finished: now release the first brain call
+                gate.set()
+
+        _, out, _ = self.drive(session, self.ASK + [SIL] * 5 + self.ASK + [SIL] * 60, on_read)
+        self.assertEqual(out.count("(wake word detected)"), 2)  # the second wake was noticed while the first was in the brain
+        self.assertIn("superseded", out)
+        self.assertEqual(tts.spoken, ["second answer."])  # only the newest request is answered
+
+    def test_a_false_wake_heard_as_nothing_does_not_drop_a_good_reply(self):
+        gate = threading.Event()
+
+        def brain(text):
+            gate.wait(10)
+            return "the real answer"
+
+        session, tts = self.session(brain, stt=FakeSTT("real question", ""))  # 2nd capture: STT hears nothing
+        _, out, _ = self.drive(session, self.ASK + [SIL] * 5 + self.ASK + [SIL] * 30, lambda i: gate.set() if i > 2 * len(self.ASK) + 20 else None)
+        self.assertIn("heard nothing I could make out", out)
+        self.assertNotIn("superseded", out)
+        self.assertEqual(tts.spoken, ["the real answer."])
+
+    def test_a_turn_that_raises_does_not_stop_the_assistant_listening(self):
+        calls = []
+
+        def brain(text):
+            calls.append(text)
+            if len(calls) == 1:
+                raise RuntimeError("provider exploded")
+            return "recovered"
+
+        session, tts = self.session(brain, stt=FakeSTT("one", "two"))
+        _, out, err = self.drive(session, self.ASK + [SIL] * 10 + self.ASK + [SIL] * 30)
+        self.assertIn("that turn failed", err)
+        self.assertIn("still listening", err)
+        self.assertEqual(calls, ["one", "two"])  # the next turn ran: it did not fall out of the loop
+        self.assertEqual(tts.spoken, ["recovered."])
+
+    def test_a_stt_failure_is_contained_too(self):
+        class BadSTT(FakeSTT):
+            def transcribe(self, audio):
+                raise VoiceUnavailableError("vosk crashed")
+
+        session, _ = self.session(lambda t: "x", stt=BadSTT())
+        _, _, err = self.drive(session, self.ASK + [SIL] * 20)
+        self.assertIn("that turn failed", err)
+
+    def test_a_stuck_speaker_cannot_hold_the_assistant_in_speaking_forever(self):
+        class StuckTTS(FakeTTS):
+            def speak(self, text):
+                self.spoken.append(text)
+                self.started.set()
+                self._stop.wait(30)  # never finishes on its own
+
+        tts = StuckTTS()
+        session, _ = self.session(lambda t: "a reply", tts=tts, speech_timeout_min_s=0.3, speech_slack_s=0.0, barge_in_warmup_frames=5)
+        script = self.ASK + [ECHO] * 5
+
+        def on_read(i):
+            if i >= len(self.ASK):
+                time.sleep(0.02)  # let wall-clock time pass so the watchdog deadline is reached
+
+        stream = ScriptedStream(script + [ECHO] * 60 + [SIL] * 5 + self.ASK + [SIL] * 20, on_read)
+        stt = FakeSTT("first", "second")
+        session._stt = stt
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(pipeline, "_open_input_stream", return_value=stream), redirect_stdout(out), redirect_stderr(err):
+            try:
+                session.run_forever()
+            except KeyboardInterrupt:
+                pass
+            session.wait_idle(5)
+        self.assertIn("speech timed out", err.getvalue())
+        self.assertGreaterEqual(tts.stops, 1)
+        self.assertGreaterEqual(out.getvalue().count("(wake word detected)"), 2)  # it woke AGAIN after the stuck reply
+
+    def test_a_reply_is_not_spoken_into_a_request_being_captured(self):
+        gate = threading.Event()
+
+        def brain(text):
+            gate.wait(10)
+            return "answer"
+
+        session, tts = self.session(brain, stt=FakeSTT("q1", "q2"))
+        state = {"capturing_when_spoken": None}
+        orig_speak = tts.speak
+
+        def speak(text):
+            state["capturing_when_spoken"] = session._capturing.is_set()
+            orig_speak(text)
+
+        tts.speak = speak
+
+        def on_read(i):
+            if i == len(self.ASK) + 12:  # the second capture is under way -> the first brain call completes now
+                gate.set()
+
+        _, out, _ = self.drive(session, self.ASK + [SIL] * 5 + self.ASK + [SIL] * 40, on_read)
+        self.assertNotEqual(state["capturing_when_spoken"], True)  # never started talking while the user was mid-request
+
+    def test_standby_is_announced_after_a_reply_and_the_next_wake_works(self):
+        session, tts = self.session(lambda t: "short reply", stt=FakeSTT("one", "two"))
+        _, out, _ = self.drive(session, self.ASK + [SIL] * 160 + self.ASK + [SIL] * 160)  # the first reply is long finished before the next wake
+        self.assertIn("(standby", out)
+        self.assertEqual(out.count("(wake word detected)"), 2, out)
+        self.assertEqual(tts.spoken, ["short reply.", "short reply."], out)
+
+    def test_timing_is_reported_per_turn_so_stalls_are_visible(self):
+        session, _ = self.session(lambda t: "hi", stt=FakeSTT("q"))
+        _, out, _ = self.drive(session, self.ASK + [SIL] * 60)
+        self.assertRegex(out, r"\[timing\] stt [0-9.]+s \| brain [0-9.]+s")
+
+
 class EchoGuardTests(unittest.TestCase):
     def test_own_voice_is_recognised_but_real_speech_and_short_replies_are_not(self):
         reply = "The time is twelve thirty in the afternoon"
@@ -367,6 +565,7 @@ class HandsFreeLoopTests(unittest.TestCase):
                 session.run_forever()
             except KeyboardInterrupt:
                 pass
+            session.wait_idle(5)
         self.assertEqual(order[:3], ["wake.load", "stt.load", "mic.open"])
 
     def test_an_empty_turn_says_so_instead_of_vanishing(self):
@@ -408,6 +607,7 @@ class HandsFreeLoopTests(unittest.TestCase):
                 session.run_forever()
             except KeyboardInterrupt:
                 pass
+            session.wait_idle(5)
         self.assertEqual(tts.stops, 1)
         self.assertEqual(brain, ["what time is it", "stop and tell me a joke instead"])
         self.assertEqual(stt.calls, 2)
@@ -426,6 +626,7 @@ class HandsFreeLoopTests(unittest.TestCase):
                 session.run_forever()
             except KeyboardInterrupt:
                 pass
+            session.wait_idle(5)
         self.assertEqual(tts.stops, 1)  # exactly one stop: the loud voice, not the 200 frames of echo
         self.assertEqual(brain, ["what is the capital of france", "wait I have a different question"])
 
@@ -445,6 +646,7 @@ class HandsFreeLoopTests(unittest.TestCase):
                 session.run_forever()
             except KeyboardInterrupt:
                 pass
+            session.wait_idle(5)
         self.assertIn("(interrupted", out.getvalue())  # visible in the log, not silent
         self.assertEqual(tts.stops, 1)  # stopped by the voice, not by 120 frames of echo
         self.assertEqual(brain, ["what is the capital of france", "wait what about germany"])  # the interruption was heard
@@ -460,6 +662,7 @@ class HandsFreeLoopTests(unittest.TestCase):
                 session.run_forever()
             except KeyboardInterrupt:
                 pass
+            session.wait_idle(5)
         self.assertEqual(tts.stops, 0)  # 300 frames (9 s) of echo flagged as speech: never interrupted
         tts.stop()  # release the blocked speech thread
 
@@ -474,6 +677,7 @@ class HandsFreeLoopTests(unittest.TestCase):
                 session.run_forever()
             except KeyboardInterrupt:
                 pass
+            session.wait_idle(5)
         self.assertEqual(tts.stops, 0)
         self.assertEqual(brain, ["first question here"])
         tts.stop()  # release the blocked speech thread
@@ -492,6 +696,7 @@ class HandsFreeLoopTests(unittest.TestCase):
                 session.run_forever()
             except KeyboardInterrupt:
                 pass
+            session.wait_idle(5)
         self.assertEqual(brain, ["what is the weather"])  # never replied to itself
         self.assertIn("ignored", out.getvalue())
 
