@@ -14,6 +14,11 @@ These are the leading candidates named in §20B, not a frozen final stack:
   only; a custom "Hey Ciphlet" model must be trained before wake detection
   matches the intended phrase (§4.1). Point CIPHLET_WAKE_MODEL at a trained
   model file once one exists.
+- PocketSphinxWakeProvider — the custom "Hey Ciphlet" phrase with NO trained
+  model: keyword spotting on a pronunciation-dictionary entry (SIGH-flit, per
+  the spec). This is the technique CIPHER's own macOS wake listener used
+  ("S AY F ER" for "cipher"). Less accurate than a trained openWakeWord model;
+  it is what wakes Ciphlet by name until hey_ciphlet.onnx is trained.
 - VoskSTT — VOSK, offline batch-decode STT (donor-proven, §20B).
 - PiperTTS — Piper via its CLI binary + `aplay` for playback, so stop()
   can kill the playback subprocess for true barge-in (§4.6). Piper is a
@@ -123,6 +128,114 @@ class OpenWakeWordProvider(WakeProvider):
         # the phrase (or TTS echo) from before a turn can't re-trigger.
         if self._model is not None:
             self._model.reset()
+
+
+DEFAULT_KWS_THRESHOLD = 1e-20  # smaller = more sensitive (more false wakes); tune with `ciphlet voice --selftest`
+
+
+class PocketSphinxWakeProvider(WakeProvider):
+    """"Hey Ciphlet" via PocketSphinx keyword spotting (no training needed).
+
+    "ciphlet" is not in the bundled English dictionary, so it is added by its
+    phones: SIGH-flit (spec §"Ciphlet is pronounced SIGH-flit") plus a
+    reduced-vowel variant, each as its own keyphrase with `threshold`.
+    """
+
+    PRONUNCIATIONS = (("ciphlet", "S AY F L IH T"), ("ciphletb", "S AY F L AH T"))
+    RESTART_AFTER_WINDOWS = 250  # ~20 s of 80 ms windows: bound the decoder's utterance state
+
+    def __init__(self, threshold: float = DEFAULT_KWS_THRESHOLD, sample_rate: int = 16000) -> None:
+        self._threshold = threshold
+        self._sample_rate = sample_rate
+        self._decoder = None
+        self._windows = 0
+
+    def load(self) -> None:
+        """Build the decoder now (fail fast at startup instead of on first audio)."""
+        self._get_decoder()
+
+    def _get_decoder(self):
+        if self._decoder is None:
+            try:
+                from pocketsphinx import Decoder
+            except ImportError as exc:
+                raise VoiceUnavailableError(
+                    f"'pocketsphinx' is not installed ({exc}). Run deploy/install_voice.sh on the Pi."
+                ) from exc
+            try:
+                decoder = Decoder(lm=None, samprate=self._sample_rate, kws_threshold=self._threshold, loglevel="ERROR")
+                for word, phones in self.PRONUNCIATIONS:
+                    if decoder.lookup_word(word) is None:
+                        decoder.add_word(word, phones, update=True)
+                with tempfile.NamedTemporaryFile("w", suffix=".kws", delete=False) as fh:
+                    for word, _ in self.PRONUNCIATIONS:
+                        fh.write(f"hey {word} /{self._threshold:g}/\n")
+                    keyfile = fh.name
+                try:
+                    decoder.add_kws("ciphlet-wake", keyfile)
+                finally:
+                    Path(keyfile).unlink(missing_ok=True)
+                decoder.activate_search("ciphlet-wake")
+                decoder.start_utt()
+            except Exception as exc:
+                raise VoiceUnavailableError(f"Failed to set up the PocketSphinx wake phrase: {exc}") from exc
+            self._decoder = decoder
+        return self._decoder
+
+    def _restart(self, decoder) -> None:
+        try:
+            decoder.end_utt()
+        except RuntimeError:
+            pass  # no utterance in progress
+        decoder.start_utt()
+        self._windows = 0
+
+    def detect(self, audio_chunk: bytes) -> bool:
+        decoder = self._get_decoder()
+        try:
+            decoder.process_raw(audio_chunk, no_search=False, full_utt=False)
+            hit = decoder.hyp() is not None
+            self._windows += 1
+            if hit or self._windows >= self.RESTART_AFTER_WINDOWS:
+                self._restart(decoder)
+        except RuntimeError as exc:
+            raise VoiceUnavailableError(f"PocketSphinx wake detection failed: {exc}") from exc
+        return hit
+
+    def reset(self) -> None:
+        if self._decoder is not None:
+            self._restart(self._decoder)
+
+
+def build_wake_provider(config) -> tuple[WakeProvider, str]:
+    """Pick the wake engine. Returns (provider, human phrase to say).
+
+    1. A trained custom model (CIPHLET_WAKE_MODEL) -> openWakeWord on that file.
+    2. CIPHLET_WAKE_ENGINE=openwakeword -> openWakeWord's generic phrases
+       ("hey jarvis"/"alexa"...), a bring-up aid only, not the final wake word.
+    3. Otherwise ("auto"/"pocketsphinx") -> PocketSphinx "Hey Ciphlet"; in
+       "auto", if PocketSphinx isn't usable, fall back to the generic phrases
+       with a loud warning (never silently).
+    """
+    generic = '"hey jarvis", "alexa", "hey mycroft" or "hey rhasspy" (temporary bring-up phrases)'
+    if config.wake_model_path:
+        return OpenWakeWordProvider(model_path=config.wake_model_path), '"Hey Ciphlet" (custom model)'
+    engine = getattr(config, "wake_engine", "auto")
+    if engine not in ("auto", "pocketsphinx", "openwakeword"):
+        raise VoiceUnavailableError(
+            f"CIPHLET_WAKE_ENGINE='{engine}' is not valid — use auto, pocketsphinx or openwakeword."
+        )
+    if engine == "openwakeword":
+        return OpenWakeWordProvider(), generic
+    provider = PocketSphinxWakeProvider(threshold=getattr(config, "wake_kws_threshold", DEFAULT_KWS_THRESHOLD))
+    try:
+        provider.load()
+    except VoiceUnavailableError as exc:
+        if engine == "pocketsphinx":
+            raise
+        print(f"WARNING: 'Hey Ciphlet' wake phrase unavailable ({exc}); using generic phrases instead.", file=sys.stderr)
+        return OpenWakeWordProvider(), generic
+    return provider, '"Hey Ciphlet"'
 
 
 class VoskSTT(STTProvider):
@@ -286,6 +399,17 @@ class PiperTTS(TTSProvider):
                 f"Audio playback failed{where} (exit {player.returncode}): {player_msg} — check the speaker "
                 "with 'aplay -l', or set CIPHLET_AUDIO_OUTPUT_DEVICE (deploy/install_voice.sh detects it)."
             )
+
+    def synthesize(self, text: str) -> tuple[bytes, int]:
+        """Raw mono S16 PCM for `text` and its sample rate, without playing it
+        (used by `ciphlet voice --selftest` to test wake detection)."""
+        cmd = [*self._piper_command(), "--model", self._model_path, "--output-raw"]
+        result = subprocess.run(cmd, input=text.encode("utf-8"), capture_output=True, timeout=60)
+        if result.returncode != 0:
+            raise VoiceUnavailableError(
+                f"Piper synthesis failed (exit {result.returncode}): {result.stderr.decode(errors='replace').strip()}"
+            )
+        return result.stdout, self._sample_rate
 
     def stop(self) -> None:
         # True barge-in (§4.6): kill both the player and the (possibly

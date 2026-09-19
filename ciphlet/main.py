@@ -193,7 +193,7 @@ def run_voice(args: argparse.Namespace) -> None:
     )
 
     from ciphlet.voice.pipeline import HandsFreeVoiceSession, PTTVoiceSession
-    from ciphlet.voice.providers import OpenWakeWordProvider, PiperTTS, VoskSTT, WebRTCVadAudioProcessor
+    from ciphlet.voice.providers import PiperTTS, VoskSTT, WebRTCVadAudioProcessor, build_wake_provider
 
     if not config.piper_model_path:
         print(
@@ -223,7 +223,7 @@ def run_voice(args: argparse.Namespace) -> None:
     try:
         if args.hands_free:
             audio = WebRTCVadAudioProcessor()
-            wake = OpenWakeWordProvider(model_path=config.wake_model_path)
+            wake, wake_label = build_wake_provider(config)
             session = HandsFreeVoiceSession(
                 audio,
                 wake,
@@ -233,12 +233,8 @@ def run_voice(args: argparse.Namespace) -> None:
                 input_device=config.audio_input_device,
                 on_reply=_print_brain_info,
                 barge_in_frames=config.barge_in_frames,
+                wake_label=wake_label,
             )
-            if not config.wake_model_path:
-                print(
-                    'No custom "Hey Ciphlet" model is installed yet — wake it by saying '
-                    '"hey jarvis", "alexa", "hey mycroft" or "hey rhasspy".'
-                )
             session.run_forever()
         else:
             session = PTTVoiceSession(stt, tts, orchestrator.handle_text, input_device=config.audio_input_device)

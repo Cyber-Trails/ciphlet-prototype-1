@@ -311,6 +311,7 @@ class HandsFreeVoiceSession:
         input_device: str | int | None = None,
         on_reply: Callable[[str], None] | None = None,
         barge_in_frames: int = BARGE_IN_DEBOUNCE_FRAMES,
+        wake_label: str = '"Hey Ciphlet"',
     ) -> None:
         self._audio = audio
         self._wake = wake
@@ -329,6 +330,7 @@ class HandsFreeVoiceSession:
         # barge-in (use if the speaker bleeds into the mic — see --selftest).
         self._barge_in_frames = barge_in_frames
         self._last_reply = ""
+        self._wake_label = wake_label
 
     def _check_wake(self, conditioned: bytes) -> bool:
         """Accumulate VAD-sized frames into openWakeWord-sized windows
@@ -348,7 +350,7 @@ class HandsFreeVoiceSession:
         self._wake.reset()
 
     def run_forever(self) -> None:
-        print('Ciphlet is listening for "Hey Ciphlet"... (Ctrl+C to stop)')
+        print(f"Ciphlet is listening for {self._wake_label}... (Ctrl+C to stop)")
         stream = _open_input_stream(self._input_device)
         speech_run = 0  # consecutive speech frames seen while Ciphlet is talking — see BARGE_IN_DEBOUNCE_FRAMES
         recent: deque = deque(maxlen=max(self._barge_in_frames, 1))  # those frames, kept so the interruption isn't clipped

@@ -110,7 +110,7 @@ mkdir -p "$MODELS_DIR/wake"
 # Fails the install loudly here rather than at first `ciphlet voice --hands-free`.
 # Runs one silent 80ms window (1280 samples of int16) through the ONNX pipeline.
 echo
-echo "-- Verifying wake-word runtime (ONNX backend) --"
+echo "-- Verifying wake-word runtimes (openWakeWord ONNX + PocketSphinx \"Hey Ciphlet\") --"
 WAKE_CHECK_PATH=""
 [ -f "$WAKE_MODEL" ] && WAKE_CHECK_PATH="$WAKE_MODEL"
 WAKE_CHECK_PATH="$WAKE_CHECK_PATH" python3 - <<'PY'
@@ -125,6 +125,16 @@ except VoiceUnavailableError as exc:
     print(f"Wake-word runtime check FAILED: {exc}", file=sys.stderr)
     sys.exit(1)
 print("Wake-word runtime OK (" + (path or "bundled pretrained models") + ")")
+
+# "Hey Ciphlet" via PocketSphinx keyword spotting (no trained model needed)
+from ciphlet.voice.providers import PocketSphinxWakeProvider
+
+try:
+    PocketSphinxWakeProvider().detect(bytes(1280 * 2))
+except VoiceUnavailableError as exc:
+    print(f'"Hey Ciphlet" (PocketSphinx) wake check FAILED: {exc}', file=sys.stderr)
+    sys.exit(1)
+print('"Hey Ciphlet" wake phrase (PocketSphinx) OK')
 PY
 
 # --- 8. Wire model paths into .env (idempotent — never overwrites your config) ---
@@ -163,10 +173,11 @@ echo
 echo ".env is configured for voice (existing non-empty values were preserved)."
 if [ ! -f "$WAKE_MODEL" ]; then
     echo "No trained \"Hey Ciphlet\" model at $WAKE_MODEL yet, so CIPHLET_WAKE_MODEL"
-    echo "was left alone and openWakeWord's generic pretrained models load instead"
-    echo "(test with \"hey jarvis\" / \"alexa\" for now). To train a real one, see"
-    echo "deploy/wake_word/TRAINING.md (GPU-class job — run on Colab, not here),"
-    echo "place the result at $WAKE_MODEL, and re-run this script."
+    echo "was left alone and Ciphlet wakes on \"Hey Ciphlet\" using PocketSphinx keyword"
+    echo "spotting (no training needed; tune with CIPHLET_WAKE_KWS_THRESHOLD). A trained"
+    echo "openWakeWord model would be more accurate: see deploy/wake_word/TRAINING.md"
+    echo "(GPU-class job — run on Colab, not here), place the result at $WAKE_MODEL,"
+    echo "and re-run this script."
 fi
 echo
 echo "Mic/speaker device selection (only needed if the Pi's default audio"

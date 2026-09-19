@@ -124,3 +124,67 @@ class RunSelftestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(np is None, "numpy not installed")
+class WakePhraseStageTests(unittest.TestCase):
+    """Piper-synthesized wake phrase: fires on the phrase, quiet on other speech."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = Path(self.tmp.name)
+        (d / "v.onnx").write_text("x")
+        (d / "v.onnx.json").write_text("{}")
+        (d / "vosk").mkdir()
+        self.config = SimpleNamespace(
+            audio_input_device=None, audio_output_device=None, piper_model_path=str(d / "v.onnx"),
+            vosk_model_path=str(d / "vosk"), wake_model_path=None, barge_in_frames=3,
+        )
+
+    def run_it(self, wake_behaviour):
+        class TTS:
+            def speak(_, text): pass
+            def stop(_): pass
+            def synthesize(_, text):  # loud only for the wake phrase
+                amp = 1000 if text == "hey ciphlet" else 0
+                return np.full(22050, amp, dtype=np.int16).tobytes(), 22050
+
+        class Audio:
+            def condition(_, b): return b
+            def is_speech(_, b): return False
+
+        class STT:
+            def transcribe(_, a): return "hello"
+
+        class Wake:
+            def reset(_): pass
+            def detect(_, chunk):
+                loud = bool(np.abs(np.frombuffer(chunk, dtype=np.int16)).max() > 200)
+                return {"good": loud, "deaf": False, "trigger_happy": True}[wake_behaviour]
+
+        class Stream:
+            def read(_, n): return np.full((n, 1), 3000, dtype=np.int16), False
+            def stop(_): pass
+            def close(_): pass
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            selftest.run_selftest(
+                self.config, tts=TTS(), stt=STT(), audio=Audio(), wake=Wake(), wake_label='"Hey Ciphlet"',
+                open_stream=lambda dev: Stream(), interactive=False,
+            )
+        return out.getvalue()
+
+    def test_phrase_fires_and_other_speech_does_not(self):
+        self.assertIn("[PASS] wake phrase", self.run_it("good"))
+
+    def test_deaf_engine_gets_a_more_sensitive_hint(self):
+        out = self.run_it("deaf")
+        self.assertIn("[WARN] wake phrase", out)
+        self.assertIn("smaller", out)
+
+    def test_trigger_happy_engine_gets_a_stricter_hint(self):
+        out = self.run_it("trigger_happy")
+        self.assertIn("[WARN] wake phrase", out)
+        self.assertIn("larger", out)

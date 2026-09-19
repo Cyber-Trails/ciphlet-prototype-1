@@ -31,6 +31,10 @@ voice = [
     "numpy>=1.26",
     "vosk>=0.3.45",
     "webrtcvad>=2.0.10",
+    # "Hey Ciphlet" wake phrase without a trained model (PocketSphinx keyword
+    # spotting — the technique CIPHER's macOS wake listener used). cp313
+    # aarch64 wheels exist, so no build step on the Pi.
+    "pocketsphinx>=5.1.1,<6",
     "piper-tts>=1.2",
     # openWakeWord is deliberately NOT listed here — deploy/install_voice.sh
     # installs it with `pip install --no-deps 'openwakeword==0.6.0'`.

@@ -46,6 +46,31 @@ def recommend_barge_in(longest_echo_run: int, current: int) -> int:
     return 0
 
 
+def _phrase_pcm_16k(tts, text: str) -> bytes:
+    """Piper-synthesize `text`, resample to 16 kHz mono int16, with a little
+    lead/trail silence — audio a wake engine can be fed directly."""
+    import numpy as np
+
+    pcm, rate = tts.synthesize(text)
+    samples = np.frombuffer(pcm, dtype=np.int16)
+    if rate != pipeline.SAMPLE_RATE:
+        samples = pipeline._StreamResampler(rate, pipeline.SAMPLE_RATE).process(samples)
+    pad = np.zeros(pipeline.SAMPLE_RATE // 2, dtype=np.int16)
+    return np.concatenate((pad, samples, pad)).tobytes()
+
+
+def wake_fires(wake, pcm: bytes) -> bool:
+    """Feed 80 ms windows of `pcm` to the wake engine; did it ever fire?"""
+    step = pipeline.WAKE_CHUNK_SAMPLES * 2
+    wake.reset()
+    hit = False
+    for i in range(0, len(pcm) - step + 1, step):
+        if wake.detect(pcm[i : i + step]):
+            hit = True
+    wake.reset()
+    return hit
+
+
 def _levels(frames) -> tuple[int, float]:
     import numpy as np
 
@@ -75,11 +100,12 @@ def run_selftest(
     stt=None,
     audio=None,
     wake=None,
+    wake_label: str | None = None,
     open_stream=None,
     ask=input,
     interactive: bool | None = None,
 ) -> int:
-    from ciphlet.voice.providers import OpenWakeWordProvider, PiperTTS, VoskSTT, WebRTCVadAudioProcessor
+    from ciphlet.voice.providers import PiperTTS, VoskSTT, WebRTCVadAudioProcessor, build_wake_provider
 
     interactive = sys.stdin.isatty() if interactive is None else interactive
     open_stream = open_stream or pipeline._open_input_stream
@@ -108,7 +134,13 @@ def run_selftest(
     tts = tts or PiperTTS(model_path=piper_path, output_device=config.audio_output_device)
     stt = stt or VoskSTT(model_path=vosk_path)
     audio = audio or WebRTCVadAudioProcessor()
-    wake = wake or OpenWakeWordProvider(model_path=config.wake_model_path)
+    if wake is None:
+        try:
+            wake, wake_label = build_wake_provider(config)
+        except VoiceUnavailableError as exc:
+            report.add("FAIL", "wake model", str(exc))
+            wake = None
+    wake_label = wake_label or "the wake phrase"
 
     # 2. Speaker -------------------------------------------------------------
     print("\n-- Speaker: you should hear a spoken sentence now --")
@@ -168,22 +200,39 @@ def run_selftest(
         else:
             report.add("PASS", "microphone+VAD+VOSK", detail)
 
-    # 4. Wake model ----------------------------------------------------------
-    print("\n-- Wake word model --")
-    try:
-        windows = 0
-        wake.reset()
-        flat = b"".join(f.tobytes() for f in frames_16k) or bytes(pipeline.WAKE_CHUNK_SAMPLES * 2 * 5)
-        step = pipeline.WAKE_CHUNK_SAMPLES * 2
-        for i in range(0, len(flat) - step + 1, step):
-            wake.detect(flat[i : i + step])
-            windows += 1
-        wake.reset()
-    except VoiceUnavailableError as exc:
-        report.add("FAIL", "wake model", str(exc))
-    else:
-        phrases = "your trained model" if config.wake_model_path else '"hey jarvis", "alexa", "hey mycroft" or "hey rhasspy"'
-        report.add("PASS", "wake model", f"loaded and ran on {windows} windows; say {phrases} to wake it")
+    # 4. Wake engine ---------------------------------------------------------
+    print("\n-- Wake word --")
+    if wake is not None:
+        try:
+            windows = 0
+            wake.reset()
+            flat = b"".join(f.tobytes() for f in frames_16k) or bytes(pipeline.WAKE_CHUNK_SAMPLES * 2 * 5)
+            step = pipeline.WAKE_CHUNK_SAMPLES * 2
+            for i in range(0, len(flat) - step + 1, step):
+                wake.detect(flat[i : i + step])
+                windows += 1
+            wake.reset()
+        except VoiceUnavailableError as exc:
+            report.add("FAIL", "wake model", str(exc))
+        else:
+            report.add("PASS", "wake model", f"loaded and ran on {windows} windows; say {wake_label} to wake it")
+            # Does the engine actually fire on the phrase (and stay quiet on
+            # other speech)? Uses Piper-synthesized speech, so it needs no human
+            # and is repeatable; real voices still vary — see the hands-free test.
+            if hasattr(tts, "synthesize") and speaker_ok:
+                positive = "hey jarvis" if "jarvis" in wake_label else "hey ciphlet"
+                try:
+                    hit = wake_fires(wake, _phrase_pcm_16k(tts, positive))
+                    false_hits = [t for t in (SPEAKER_PHRASE, ECHO_PHRASE) if wake_fires(wake, _phrase_pcm_16k(tts, t))]
+                except VoiceUnavailableError as exc:
+                    report.add("WARN", "wake phrase", f"could not synthesize test audio: {exc}")
+                else:
+                    if hit and not false_hits:
+                        report.add("PASS", "wake phrase", f"fires on synthesized '{positive}', stays quiet on other sentences")
+                    elif not hit:
+                        report.add("WARN", "wake phrase", f"did NOT fire on synthesized '{positive}' — make it more sensitive (CIPHLET_WAKE_KWS_THRESHOLD smaller, e.g. 1e-30) or check pronunciation")
+                    else:
+                        report.add("WARN", "wake phrase", f"fired on ordinary sentences ({len(false_hits)} of 2) — make it stricter (CIPHLET_WAKE_KWS_THRESHOLD larger, e.g. 1e-10)")
 
     # 5. Speaker-into-mic bleed (decides whether barge-in is safe) -----------
     print("\n-- Speaker->mic bleed: stay QUIET while I speak (measures barge-in safety) --")

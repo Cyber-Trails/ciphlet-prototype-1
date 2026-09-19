@@ -104,6 +104,23 @@ This section is the authoritative current state for the local brain. Everything 
 
 ---
 
+## Voice architecture evaluation + "Hey Ciphlet" wake phrase (2026-09-19)
+
+**Status: architecture decision recorded; wake phrase IMPLEMENTED / TESTED OFF-PI — PI VERIFICATION STILL PENDING** (Pi was reachable at `10.0.0.23` but SSH authentication was not yet set up from the Mac).
+
+**Historical evidence located (outside this repo, on the Mac under `~/Developer`):**
+- `CIPHER_JARVIS_BASELINE/` — the LiveKit Agents starter that became CIPHER's realtime stack. `Developmental Roadmap -LIST.md` records it as done on the Mac as a *server + worker + room* system (LiveKit 1.7.1, managed self-hosted LiveKit, worker cutover, full-duplex voice), and also records **rejections**: the "persistent hot voice/session architecture" (`fb2cb06`) and an unsupported LiveKit timeout configuration. "Wake Call" is listed as NOT IMPLEMENTED there.
+- `CIPHER3/cipher_wake_listener.py` — CIPHER's actual wake mechanism was **not** LiveKit: a separate PocketSphinx keyword-spotting listener (`pocketsphinx==5.1.1`, phones `S AY F ER` for "cipher").
+- This repo: spec §20B (voice architecture direction finalized: local, replaceable providers; exact components pending real Pi benchmarking) and `docs/THIRD_PARTY_NOTICES.md` (three Pi voice assistants as donors). No LiveKit/F.R.I.D.A.Y. material is in this repo.
+
+**Decision — keep the current provider architecture; do not replace it with LiveKit now.** Reasons: (1) every real Pi failure so far (mic rate, speaker route/rate) was at the ALSA/PortAudio device edge, which a LiveKit deployment on the Pi would still have to solve (it needs a Pi-side client capturing/playing through the same devices); (2) the Mac record shows LiveKit costs a server + worker + room lifecycle, with several rejected variants; (3) wake-word detection is not a LiveKit capability (CIPHER used a separate listener); (4) VOSK/Piper are not LiveKit built-ins (CIPHER needed a custom local-TTS plugin); (5) §20B requires local, replaceable providers. This is an engineering evaluation from the records, not an owner ruling — the owner may reopen it. **One place a proven component could genuinely help is acoustic echo cancellation** (WebRTC audio processing, which LiveKit's client SDK bundles) for speaker→mic bleed; whether it is needed is decided by the bleed `ciphlet voice --selftest` measures on the Pi, and its slot is the existing `AudioProcessor.condition()` interface, not a pipeline rewrite.
+
+**"Hey Ciphlet" wake word — no trained model exists** (searched this repo and `~/Developer`: no `hey_ciphlet` `.onnx/.tflite`, no notebook; training remains a GPU-class Colab job, `deploy/wake_word/TRAINING.md`). Implemented instead, reusing CIPHER's proven technique: `PocketSphinxWakeProvider` (`ciphlet/voice/providers.py`) spots "hey ciphlet" from a pronunciation entry — **SIGH-flit** per spec line 1421 (`S AY F L IH T`, plus a reduced-vowel variant) — with a tunable threshold (`CIPHLET_WAKE_KWS_THRESHOLD`, default `1e-20`, smaller = more sensitive). `build_wake_provider` selects: trained `CIPHLET_WAKE_MODEL` (openWakeWord) → else PocketSphinx "Hey Ciphlet" (`CIPHLET_WAKE_ENGINE=auto`); openWakeWord's generic "hey jarvis"/"alexa" phrases are now only an explicit choice (`openwakeword`) or a loudly-warned fallback. `pocketsphinx>=5.1.1,<6` added to the voice extra (cp313 aarch64 wheel exists; pip dry-run resolves). It is less accurate than a trained model — expect to tune the threshold on the Pi; a trained `hey_ciphlet.onnx` placed at `models/wake/` is still the better long-term answer and is picked up automatically. `ciphlet voice --selftest` now also has Piper *say* the wake phrase and other sentences and checks the wake engine fires on the first and stays quiet on the rest (with threshold hints), and the installer smoke-tests both wake engines.
+
+**Off-Pi verification:** 100 tests (fake `pocketsphinx`/audio devices; numpy-dependent tests run in a throwaway numpy-only venv). **Not verified:** everything hardware-dependent — real detection of a human "Hey Ciphlet", threshold value, false-wake rate, and all items listed under the integrated-voice section above.
+
+---
+
 ## Clean Rebuild / Adopt-Adapt — local intelligence + voice pipeline replaced
 
 **Everything below this section (the three `local_provider.py`/llama-cli rounds) describes a superseded approach.** The per-request `llama-cli` subprocess local brain was abandoned after being implemented, deployed, and proven unusable on the Pi across three repair rounds (context/timeout hang, then a build-incompatible `-no-cnv` flag) — kept below only as historical record of what was tried and why it didn't work, not as current state.
