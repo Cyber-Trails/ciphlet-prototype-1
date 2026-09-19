@@ -211,7 +211,9 @@ def run_voice(args: argparse.Namespace) -> None:
         return run_chat(args)
 
     stt = VoskSTT(model_path=config.vosk_model_path)
-    tts = PiperTTS(model_path=config.piper_model_path, output_device=config.audio_output_device)
+    tts = PiperTTS(
+        model_path=config.piper_model_path, output_device=config.audio_output_device, volume=config.tts_volume
+    )
 
     def _print_brain_info(_reply: str) -> None:
         if orchestrator.last_brain:

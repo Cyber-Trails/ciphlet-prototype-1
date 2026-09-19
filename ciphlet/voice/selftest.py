@@ -21,6 +21,12 @@ ECHO_PHRASE = (
     "This is a longer sentence that plays through the speaker while the microphone listens, "
     "so I can measure how much of my own voice comes back in."
 )
+# Sentences the wake engine must stay quiet on. NOT the speaker-check line: it contains the name
+# "Ciphlet", which (bare name accepted) is exactly what should wake it.
+NEGATIVE_PHRASES = (
+    ECHO_PHRASE,
+    "The quick brown fox jumps over the lazy dog, then runs across the field and down to the river.",
+)
 RECORD_SECONDS = 4
 LOW_LEVEL_PEAK = 500  # int16 peak below this = mic is barely picking anything up
 
@@ -136,7 +142,7 @@ def run_selftest(
         return _finish(report)
     report.add("PASS", "config", "Piper voice, VOSK model and wake setting found")
 
-    tts = tts or PiperTTS(model_path=piper_path, output_device=config.audio_output_device)
+    tts = tts or PiperTTS(model_path=piper_path, output_device=config.audio_output_device, volume=getattr(config, "tts_volume", 1.0))
     stt = stt or VoskSTT(model_path=vosk_path)
     audio = audio or WebRTCVadAudioProcessor()
     if wake is None:
@@ -239,7 +245,7 @@ def run_selftest(
                 positive = "hey jarvis" if "jarvis" in wake_label else "hey sigh flit"
                 try:
                     hit = wake_fires(wake, _phrase_pcm_16k(tts, positive))
-                    false_hits = [t for t in (SPEAKER_PHRASE, ECHO_PHRASE) if wake_fires(wake, _phrase_pcm_16k(tts, t))]
+                    false_hits = [t for t in NEGATIVE_PHRASES if wake_fires(wake, _phrase_pcm_16k(tts, t))]
                 except VoiceUnavailableError as exc:
                     report.add("WARN", "wake phrase", f"could not synthesize test audio: {exc}")
                 else:
@@ -248,7 +254,7 @@ def run_selftest(
                     elif not hit:
                         report.add("WARN", "wake phrase", f"did NOT fire on synthesized '{positive}' — make it more sensitive (CIPHLET_WAKE_KWS_THRESHOLD smaller, e.g. 1e-30) or check pronunciation")
                     else:
-                        report.add("WARN", "wake phrase", f"fired on ordinary sentences ({len(false_hits)} of 2) — make it stricter (CIPHLET_WAKE_KWS_THRESHOLD larger, e.g. 1e-10)")
+                        report.add("WARN", "wake phrase", f"fired on ordinary sentences ({len(false_hits)} of {len(NEGATIVE_PHRASES)}) — make it stricter (CIPHLET_WAKE_KWS_THRESHOLD larger, e.g. 1e-10)")
 
     # 5. Speaker-into-mic bleed (decides whether barge-in is safe) -----------
     print("\n-- Speaker->mic bleed: stay QUIET while I speak (measures barge-in safety) --")

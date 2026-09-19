@@ -69,6 +69,14 @@ class SpeakTests(unittest.TestCase):
         self.assertIn("S16_LE", args)
         self.assertNotIn("-D", args)  # no device configured -> ALSA default
 
+    def test_volume_is_passed_to_piper_only_when_not_full_scale(self):
+        argsfile = self.dir / "piper.args"
+        piper = _script(self.dir / "piper2", f'echo "$@" > {argsfile}\ncat >/dev/null\nprintf "RAWPCM"\n')
+        self.tts(piper_bin=piper, volume=0.5).speak("hi")
+        self.assertIn("--volume 0.5", argsfile.read_text())
+        self.tts(piper_bin=piper).speak("hi")  # default 1.0
+        self.assertNotIn("--volume", argsfile.read_text())
+
     def test_configured_output_device_is_used_with_plug_conversion(self):
         self.tts(output_device="hw:2,0").speak("hello")
         args = self.args_file.read_text().split()
@@ -91,6 +99,17 @@ class SpeakTests(unittest.TestCase):
         msg = str(cm.exception)
         for part in ("plughw:9,0", "Rate 16000Hz not available", "CIPHLET_AUDIO_OUTPUT_DEVICE"):
             self.assertIn(part, msg)
+
+    def test_unopenable_device_is_blamed_on_the_player_not_on_piper(self):
+        # Real Pi finding: `aplay -D pipewire` failed to open, piper died of BrokenPipe,
+        # and the error said "Piper synthesis failed ... BrokenPipeError".
+        dead_aplay = _script(self.dir / "deadaplay", 'echo "aplay: audio open error: No such device" >&2\nexit 1\n')
+        chatty_piper = _script(self.dir / "spiper", 'cat >/dev/null\nhead -c 200000 /dev/zero\necho "BrokenPipeError: [Errno 32]" >&2\nexit 1\n')
+        with self.assertRaises(VoiceUnavailableError) as cm:
+            self.tts(piper_bin=chatty_piper, player_bin=dead_aplay, output_device="pipewire").speak("hi")
+        self.assertIn("Audio playback failed", str(cm.exception))
+        self.assertIn("No such device", str(cm.exception))
+        self.assertNotIn("Piper synthesis failed", str(cm.exception))
 
     def test_chatty_stderr_cannot_deadlock_synthesis(self):
         # >64 KB on stderr would fill an unread pipe and hang the old implementation.

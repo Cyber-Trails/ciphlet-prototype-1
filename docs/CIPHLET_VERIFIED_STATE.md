@@ -141,6 +141,18 @@ Deployed with `deploy/sync_to_pi.sh` to `ciphlet@10.0.0.23` (Raspberry Pi 5, Deb
 
 ---
 
+## Real-human calibration on the Pi: "Hey Ciphlet" and barge-in (2026-09-19)
+
+Method: the Pi spoke prompts through its own speaker; the owner said "Hey Ciphlet" after each beep (11 usable trials; 1 more was silent) and tried to interrupt two long replies. Recordings were analysed offline on the Pi. Everything here is one speaker, one room, one mic — tuned to the owner, not a general benchmark.
+
+**Wake ("Hey Ciphlet", PocketSphinx):** the shipped threshold detected **0/11** real utterances (VOSK heard the phrase as "cyclists", "safely", "sigh blood", "hey cycling", …). Accepting the bare name "ciphlet" as well as "hey ciphlet" and lowering the threshold: 1e-30 → 6/11, **1e-45 → 11/11**, 1e-60 → 11/11; a 16-pronunciation grid raised false wakes unacceptably (41/35 synth sentences) and gating hits to a speech onset did not help. Negatives: 22 s of the owner talking normally (0 false at 1e-30, 1 at 1e-45) + ~60 s of quiet (0 false at any threshold) + 35 synthesized technical sentences (8/35 false at 1e-45 — a stress test with unusual vocabulary). Adopted: templates `hey {w}` + `{w}`, `CIPHLET_WAKE_KWS_THRESHOLD=1e-45`. **Verdict: usable as an interim wake word in a quiet room, not "sufficiently reliable" for noisy/multi-talker settings — it false-wakes on running speech (a false wake costs a 6 s "heard nothing" timeout). A trained openWakeWord `hey_ciphlet.onnx` (external GPU/Colab job, `deploy/wake_word/TRAINING.md`) remains the proper fix.**
+
+**Barge-in:** across 22 echo-only replies the smallest self-interruption-free gate was 1.0 (9), 1.1 (3), 1.2, 1.3, 1.4, and **2.0 (1)**; the owner's ordinary loud "stop" never reached the echo level, and a close-to-the-mic "stop" would have triggered only at gate ≤ 1.5. There is no gate that separates the two cleanly at full playback volume (1.5 would cut off ~1 reply in 16 by itself). So the default gate stays at the safe 2.5 and the lever is the echo loudness: Piper output is normalised to full scale, so `CIPHLET_TTS_VOLUME` (Piper `--volume`) now defaults to **0.5** (~6 dB less echo; the owner's close-talk ratio of ~1.5–1.75 becomes ~3+). Verified on the Pi at 0.5: 10 echo-only replies all stay interruption-free at gates ≤ 1.2 (vs one needing 2.0 at full volume), the self-test's bleed stage PASSES at the 2.5 gate, and two consecutive real-brain hands-free turns ran cleanly. **Interruption by a real voice at volume 0.5 still needs a human check.**
+
+**Also fixed:** when the output device can't be opened, the error blamed Piper ("BrokenPipeError") instead of `aplay`; the player is now reported first.
+
+---
+
 ## Clean Rebuild / Adopt-Adapt — local intelligence + voice pipeline replaced
 
 **Everything below this section (the three `local_provider.py`/llama-cli rounds) describes a superseded approach.** The per-request `llama-cli` subprocess local brain was abandoned after being implemented, deployed, and proven unusable on the Pi across three repair rounds (context/timeout hang, then a build-incompatible `-no-cnv` flag) — kept below only as historical record of what was tried and why it didn't work, not as current state.

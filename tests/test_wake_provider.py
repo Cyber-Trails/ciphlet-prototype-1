@@ -135,7 +135,7 @@ def stub_pocketsphinx():
 
 
 def cfg(**kw):
-    base = dict(wake_model_path=None, wake_engine="auto", wake_kws_threshold=1e-20)
+    base = dict(wake_model_path=None, wake_engine="auto", wake_kws_threshold=1e-45)
     return SimpleNamespace(**{**base, **kw})
 
 
@@ -151,7 +151,10 @@ class PocketSphinxProviderTests(unittest.TestCase):
         self.assertEqual((d.kw["lm"], d.kw["samprate"], d.kw["kws_threshold"]), (None, 16000, 1e-25))
         self.assertEqual(d.words["ciphlet"], "S AY F L IH T")  # "SIGH-flit" (spec)
         self.assertIn("ciphletb", d.words)
-        self.assertEqual(d.kws_text.splitlines(), ["hey ciphlet /1e-25/", "hey ciphletb /1e-25/"])
+        self.assertEqual(
+            d.kws_text.splitlines(),
+            ["hey ciphlet /1e-25/", "hey ciphletb /1e-25/", "ciphlet /1e-25/", "ciphletb /1e-25/"],  # the bare name wakes it too
+        )
         self.assertEqual((d.active, d.starts), ("ciphlet-wake", 1))
         self.assertFalse(os.path.exists(d.kws_path), "temporary keyword file must be removed")
 

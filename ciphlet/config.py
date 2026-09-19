@@ -89,6 +89,9 @@ class Config:
     # Longest reply (characters) that is spoken aloud; longer replies are spoken
     # in part ("The rest is on screen") and printed in full. 0 = no cap.
     spoken_max_chars: int
+    # Piper playback volume multiplier (1.0 = full scale). Lower it so Ciphlet's own voice reaches
+    # the mic quieter than a person talking over it — that is what makes barge-in work. 
+    tts_volume: float
     # Wake engine: "auto" (default) = trained custom model if CIPHLET_WAKE_MODEL
     # is set, else the PocketSphinx "Hey Ciphlet" phrase; "pocketsphinx" or
     # "openwakeword" force one (openwakeword = generic "hey jarvis"/"alexa"
@@ -124,8 +127,9 @@ class Config:
             barge_in_frames=int(os.environ.get("CIPHLET_BARGE_IN_FRAMES") or "3"),
             barge_in_gate=float(os.environ.get("CIPHLET_BARGE_IN_GATE") or "2.5"),
             spoken_max_chars=int(os.environ.get("CIPHLET_SPOKEN_MAX_CHARS") or "600"),
+            tts_volume=float(os.environ.get("CIPHLET_TTS_VOLUME") or "0.5"),
             wake_engine=(os.environ.get("CIPHLET_WAKE_ENGINE") or "auto").strip().lower(),
-            wake_kws_threshold=float(os.environ.get("CIPHLET_WAKE_KWS_THRESHOLD") or "1e-20"),
+            wake_kws_threshold=float(os.environ.get("CIPHLET_WAKE_KWS_THRESHOLD") or "1e-45"),
         )
 
 

@@ -138,7 +138,10 @@ class OpenWakeWordProvider(WakeProvider):
             self._model.reset()
 
 
-DEFAULT_KWS_THRESHOLD = 1e-20  # smaller = more sensitive (more false wakes); tune with `ciphlet voice --selftest`
+# Chosen from real recordings of the owner saying "Hey Ciphlet" on the Pi (11 trials): at 1e-20 it
+# detected 0/11; with the bare word accepted too, 1e-30 gave 6/11 and 1e-45 gave 11/11 (1e-55 too).
+# Smaller = more sensitive = more false wakes (none in silence; some in continuous speech).
+DEFAULT_KWS_THRESHOLD = 1e-45
 
 
 class PocketSphinxWakeProvider(WakeProvider):
@@ -150,6 +153,9 @@ class PocketSphinxWakeProvider(WakeProvider):
     """
 
     PRONUNCIATIONS = (("ciphlet", "S AY F L IH T"), ("ciphletb", "S AY F L AH T"))
+    # "Hey" is often swallowed when the name is said quickly, so the bare name also wakes it
+    # ("Ciphlet, what's the weather?") — measured: 6/11 with "hey ciphlet" alone vs 11/11 with both.
+    PHRASE_TEMPLATES = ("hey {w}", "{w}")
     RESTART_AFTER_WINDOWS = 250  # ~20 s of 80 ms windows: bound the decoder's utterance state
 
     def __init__(self, threshold: float = DEFAULT_KWS_THRESHOLD, sample_rate: int = 16000) -> None:
@@ -183,8 +189,9 @@ class PocketSphinxWakeProvider(WakeProvider):
                     if decoder.lookup_word(word) is None:
                         decoder.add_word(word, phones, update=True)
                 with tempfile.NamedTemporaryFile("w", suffix=".kws", delete=False) as fh:
-                    for word, _ in self.PRONUNCIATIONS:
-                        fh.write(f"hey {word} /{self._threshold:g}/\n")
+                    for template in self.PHRASE_TEMPLATES:
+                        for word, _ in self.PRONUNCIATIONS:
+                            fh.write(f"{template.format(w=word)} /{self._threshold:g}/\n")
                     keyfile = fh.name
                 try:
                     decoder.add_kws("ciphlet-wake", keyfile)
@@ -332,8 +339,10 @@ class PiperTTS(TTSProvider):
         piper_bin: str = "piper",
         player_bin: str = "aplay",
         output_device: str | None = None,
+        volume: float = 1.0,
     ) -> None:
         self._model_path = model_path
+        self._volume = volume
         # Default: read the real rate from the voice's .onnx.json (22050 if unreadable).
         self._sample_rate = sample_rate or _voice_sample_rate(model_path, 22050)
         self._piper_bin = piper_bin
@@ -359,6 +368,11 @@ class PiperTTS(TTSProvider):
             "Run deploy/install_voice.sh on the Pi."
         )
 
+    def _volume_args(self) -> list[str]:
+        # Piper's output is normalised to full scale (and clips); at full volume Ciphlet's own
+        # voice reaches the mic as loud as a person talking, so it cannot be interrupted by voice.
+        return ["--volume", f"{self._volume:g}"] if self._volume != 1.0 else []
+
     def speak(self, text: str) -> None:
         piper_cmd = self._piper_command()
         if shutil.which(self._player_bin) is None:
@@ -377,7 +391,7 @@ class PiperTTS(TTSProvider):
         # deadlock a chatty child, and we still want the text on failure.
         with tempfile.TemporaryFile() as piper_err, tempfile.TemporaryFile() as player_err:
             piper = subprocess.Popen(
-                [*piper_cmd, "--model", self._model_path, "--output-raw"],
+                [*piper_cmd, "--model", self._model_path, "--output-raw", *self._volume_args()],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=piper_err,
@@ -409,14 +423,16 @@ class PiperTTS(TTSProvider):
             piper_msg = piper_err.read().decode(errors="replace").strip()
             player_msg = player_err.read().decode(errors="replace").strip()
 
-        if piper.returncode != 0:
-            raise VoiceUnavailableError(f"Piper synthesis failed (exit {piper.returncode}): {piper_msg}")
+        # Player first: if aplay could not open the device it exits at once and piper then dies of
+        # SIGPIPE/BrokenPipe — blaming Piper for that (as the first version did) hides the real cause.
         if player.returncode != 0:
             where = f" on '{device}'" if device else ""
             raise VoiceUnavailableError(
                 f"Audio playback failed{where} (exit {player.returncode}): {player_msg} — check the speaker "
                 "with 'aplay -l', or set CIPHLET_AUDIO_OUTPUT_DEVICE (deploy/install_voice.sh detects it)."
             )
+        if piper.returncode != 0:
+            raise VoiceUnavailableError(f"Piper synthesis failed (exit {piper.returncode}): {piper_msg}")
 
     def synthesize(self, text: str) -> tuple[bytes, int]:
         """Raw mono S16 PCM for `text` and its sample rate, without playing it
