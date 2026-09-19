@@ -304,6 +304,19 @@ class HandsFreeLoopTests(unittest.TestCase):
         _, out, _ = run(session, [WAKE] * 3 + [SIL] * 6 + [SPK] * 5 + [SIL] * 25 + [SIL] * 3)
         self.assertIn("heard nothing", out)
 
+    def test_markdown_reply_is_printed_in_full_but_spoken_clean_and_capped(self):
+        tts = FakeTTS(block=False)
+        reply = "**Hi!** Here is a table:\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n" + "Firewalls filter traffic. " * 60 + "🎯"
+        session, _ = make_session(FakeSTT("what is a firewall"), tts, replies=[reply])
+        _, out, _ = run(session, [WAKE] * 3 + [SIL] * 6 + [SPK] * 5 + [SIL] * 25 + [SIL] * 3)
+        self.assertTrue(tts.started.wait(2))
+        spoken = tts.spoken[0]
+        self.assertIn("| a | b |", out)  # the screen gets the full, original text
+        for junk in ("|", "**", "🎯", "---"):
+            self.assertNotIn(junk, spoken)  # the speaker does not
+        self.assertLessEqual(len(spoken), pipeline.SPOKEN_MAX_CHARS + len(" The rest is on screen."))
+        self.assertEqual(session._last_reply, spoken)  # echo guard compares against what was actually said
+
     def test_wake_model_is_reset_after_each_turn(self):
         wake = FakeWake()
         session, _ = make_session(FakeSTT("hello there"), FakeTTS(block=False), wake=wake)

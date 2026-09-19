@@ -235,10 +235,14 @@ def run_voice(args: argparse.Namespace) -> None:
                 barge_in_frames=config.barge_in_frames,
                 barge_in_gate=config.barge_in_gate,
                 wake_label=wake_label,
+                spoken_max_chars=config.spoken_max_chars,
             )
             session.run_forever()
         else:
-            session = PTTVoiceSession(stt, tts, orchestrator.handle_text, input_device=config.audio_input_device)
+            session = PTTVoiceSession(
+                stt, tts, orchestrator.handle_text, input_device=config.audio_input_device,
+                spoken_max_chars=config.spoken_max_chars,
+            )
             while True:
                 session.run_turn()
                 _print_brain_info("")

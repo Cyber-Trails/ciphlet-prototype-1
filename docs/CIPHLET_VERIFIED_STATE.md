@@ -121,6 +121,26 @@ This section is the authoritative current state for the local brain. Everything 
 
 ---
 
+## Real Pi verification of the integrated voice path (2026-09-19, commits `a2ffc5a` → this one)
+
+Deployed with `deploy/sync_to_pi.sh` to `ciphlet@10.0.0.23` (Raspberry Pi 5, Debian 13 trixie, Python 3.13.5, PipeWire; USB "PnP Sound Device"/PCM2902 mic, HDMI-only playback — no headphone jack on a Pi 5, no USB speaker). Everything below marked PROVEN was observed on that Pi.
+
+**Defects the real Pi exposed and that were repaired:**
+1. `webrtcvad` could not import (`pkg_resources` missing from a 3.13 venv) — VAD had never worked. Fixed: `setuptools<81` in the voice extra, installer VAD smoke test, self-test reports instead of crashing.
+2. Wake/STT models loaded lazily *after* the mic opened, losing the first seconds of audio (the wake word). Fixed: `load()` before the mic opens.
+3. After a wake, the wake word's own tail counted as "speech started", so a normal pause ended capture empty. Fixed: tail dropped, request awaited; empty turns say "(heard nothing…)".
+4. Barge-in cut every reply off ~1.5 s in: the speaker's own voice reaches the mic ~14× louder than room noise (mic rms 26 → 366; peak 4698) and the VAD calls it continuous speech (271/400 frames, 4.5 s run). Fixed: `BargeInDetector` also requires the interruption to be ≥ `CIPHLET_BARGE_IN_GATE` (2.5×) louder than the echo learned **from the echo's onset** (Piper audio starts ~1–4 s after the reply is issued — a first version that warmed up from reply start still self-interrupted at 3.8 s on the Pi). Measured on 6 varied 10–16 s replies: smallest workable gate ≤ 1.25, so 2.5 has ≥ 2× margin.
+5. The real brain answered "what is your name" with a ~350-word markdown table + emoji, which was about to be spoken verbatim (and held the ALSA device for minutes). Fixed at the voice boundary only: `speakable()` strips markdown/tables/code/emoji and caps speech at `CIPHLET_SPOKEN_MAX_CHARS` (600), printing the full text.
+6. Installer used `sudo apt` unconditionally (sudo needs a password on the Pi); now only when a package is missing.
+
+**PROVEN on the Pi:** deploy + installer (both wake engines, VAD, models); mic opens at 48 kHz and resamples; Piper → speaker plays and is picked up by the mic (audible at hardware level); VOSK transcribes both loopback speech (exact sentences) and a real human speaking (recording C); openWakeWord "alexa" fires acoustically; wake → capture → VOSK → **real brain (Groq)** → Piper, two consecutive turns in the real `ciphlet voice --hands-free` process without restart, with conversation context carried (`3 message(s) in context`); full-length replies (~17 s) with **0 self-interruptions** across 4 automated turns; PTT (`--ptt`) end to end; PocketSphinx "hey ciphlet" — **0 false activations** on 22 s of real human talk + ~60 s quiet at every threshold 1e-10…1e-50. The self-test's Piper-synthesized checks pass (PocketSphinx fires on "hey sigh flit" [spec pronunciation] and not on other sentences).
+
+**NOT proven (needs a human at the mic):** PocketSphinx "Hey Ciphlet" detecting a *real* voice — acoustic loopback of Piper speech through speaker+room never fired it at any threshold (openWakeWord "alexa" does fire that way), and the calibration session's wake-phrase steps were recorded silent, so the miss rate is unmeasured; barge-in by a real (louder) voice; whether speech is audible **by ear** (only indirectly suggested: VOSK heard the human in C say "i can hear you loud"); natural back-and-forth. Wake detection currently uses PocketSphinx (no trained model); **"Hey Ciphlet" must not be called proven until a human test passes.**
+
+**Genuine limitations found:** (a) echo cancellation is not achievable here — `pyaec` (Speex) gave only 0–7 dB ERLE on this speaker/mic (separate HDMI and USB clocks, mic hardware AGC on, room), and a wake phrase spoken over a reply is masked (scores 0.06–0.17), so talk-over interruption works only if the person is clearly louder than the echo (≥2.5×, e.g. close to the mic, or a lower playback volume); a USB speakerphone with hardware echo cancellation is the real fix. (b) VOSK small model mis-hears technical words ("firewall" → "fireball", "in" → "and"); `vosk-model-en-us-0.22-lgraph` (~128 MB) is the documented upgrade, untested. (c) The brain's replies are long/markdown-heavy for voice; brevity is a brain/prompt decision left to the owner.
+
+---
+
 ## Clean Rebuild / Adopt-Adapt — local intelligence + voice pipeline replaced
 
 **Everything below this section (the three `local_provider.py`/llama-cli rounds) describes a superseded approach.** The per-request `llama-cli` subprocess local brain was abandoned after being implemented, deployed, and proven unusable on the Pi across three repair rounds (context/timeout hang, then a build-incompatible `-no-cnv` flag) — kept below only as historical record of what was tried and why it didn't work, not as current state.

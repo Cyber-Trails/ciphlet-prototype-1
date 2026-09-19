@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 import sys
 import threading
+import unicodedata
 from collections import deque
 from math import gcd
 from typing import Callable
@@ -37,6 +38,7 @@ MAX_UTTERANCE_FRAMES = 500  # ~15s hard cap on one utterance
 POST_SPEECH_HOLDOFF_FRAMES = 15  # ~450ms of mic ignored after TTS ends, so room echo can't re-trigger wake
 WAKE_TAIL_SETTLE_FRAMES = 5  # ~150ms of silence = the wake phrase itself has ended
 WAKE_TAIL_MAX_FRAMES = 40  # ~1.2s: if speech never pauses, the user is talking straight on into their request
+SPOKEN_MAX_CHARS = 600  # ~40 s of speech; a longer reply is spoken in part and shown in full on screen
 ECHO_MIN_WORDS = 3  # a shorter transcript is never treated as Ciphlet hearing itself
 ECHO_OVERLAP = 0.8  # fraction of transcript words found in Ciphlet's last reply => it heard itself
 
@@ -285,6 +287,38 @@ def _open_input_stream(device: str | int | None):
     )
 
 
+_CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)
+_TABLE_LINE = re.compile(r"^\s*\|.*$|^\s*[-:| ]{3,}\s*$", re.MULTILINE)
+_LINK = re.compile(r"\[([^\]]+)\]\((?:[^)]*)\)")
+_URL = re.compile(r"https?://\S+")
+_MARKUP = re.compile(r"(\*\*|__|~~|`|^#{1,6}\s*|^\s*[-*+•]\s+|^\s*>\s?)", re.MULTILINE)
+
+
+def speakable(text: str, max_chars: int = SPOKEN_MAX_CHARS) -> str:
+    """Turn a (markdown, emoji-laden, possibly very long) written reply into what
+    should be *said*. Found on the real Pi: the brain answered "what is your
+    name?" with a ~350-word markdown table, so Piper would have read out pipes
+    and asterisks for minutes. The full text is still printed; only speech is
+    cleaned and capped (`max_chars` <= 0 = no cap)."""
+    text = _CODE_FENCE.sub(" (code omitted). ", text)
+    text = _TABLE_LINE.sub("", text)
+    text = _LINK.sub(r"\1", text)
+    text = _URL.sub("", text)
+    text = _MARKUP.sub("", text)
+    # drop emoji / pictographs / joiners; normalise exotic dashes and quotes
+    text = "".join(ch for ch in text if unicodedata.category(ch) not in ("So", "Cs", "Cn", "Cf") or ch in "\u2013\u2014")
+    text = re.sub("[\ufe00-\ufe0f]", "", text)  # emoji variation selectors are marks, not symbols
+    text = text.replace("\u2011", "-").replace("*", "").replace("_", " ")
+    # one line per thought -> sentences (lines with nothing pronounceable are dropped)
+    lines = [ln.strip() for ln in text.splitlines() if any(c.isalnum() for c in ln)]
+    text = " ".join(ln if ln[-1] in ".!?:" else ln + "." for ln in lines)
+    text = re.sub(r"\s+", " ", text).strip()
+    if max_chars > 0 and len(text) > max_chars:
+        cut = max(text.rfind(mark, 0, max_chars) for mark in (". ", "! ", "? "))
+        text = (text[: cut + 1] if cut >= max_chars // 2 else text[:max_chars].rsplit(" ", 1)[0]) + " The rest is on screen."
+    return text
+
+
 def _is_self_echo(heard: str, last_reply: str) -> bool:
     """True if `heard` is (nearly) just Ciphlet's own last reply coming back in
     through the mic — with no hardware echo cancellation, barge-in can trigger
@@ -305,11 +339,13 @@ class PTTVoiceSession:
         tts: TTSProvider,
         on_utterance: Callable[[str], str],
         input_device: str | int | None = None,
+        spoken_max_chars: int = SPOKEN_MAX_CHARS,
     ) -> None:
         self._stt = stt
         self._tts = tts
         self._on_utterance = on_utterance
         self._input_device = input_device
+        self._spoken_max_chars = spoken_max_chars
 
     def run_turn(self) -> None:
         import numpy as np
@@ -343,7 +379,7 @@ class PTTVoiceSession:
         print(f"You: {text}")
         reply = self._on_utterance(text)
         print(f"Ciphlet: {reply}")
-        self._tts.speak(reply)
+        self._tts.speak(speakable(reply, self._spoken_max_chars))
 
 
 class HandsFreeVoiceSession:
@@ -364,6 +400,7 @@ class HandsFreeVoiceSession:
         wake_label: str = '"Hey Ciphlet"',
         barge_in_gate: float = BARGE_IN_GATE,
         barge_in_warmup_frames: int = BARGE_IN_WARMUP_FRAMES,
+        spoken_max_chars: int = SPOKEN_MAX_CHARS,
     ) -> None:
         self._audio = audio
         self._wake = wake
@@ -384,6 +421,7 @@ class HandsFreeVoiceSession:
         self._barge = BargeInDetector(barge_in_frames, barge_in_gate, barge_in_warmup_frames)
         self._last_reply = ""
         self._wake_label = wake_label
+        self._spoken_max_chars = spoken_max_chars
 
     def _check_wake(self, conditioned: bytes) -> bool:
         """Accumulate VAD-sized frames into openWakeWord-sized windows
@@ -514,13 +552,14 @@ class HandsFreeVoiceSession:
 
         print(f"You: {text}")
         reply = self._on_utterance(text)
-        self._last_reply = reply
+        spoken = speakable(reply, self._spoken_max_chars)
+        self._last_reply = spoken  # what was actually said (so hearing it back is recognised as echo)
         print(f"Ciphlet: {reply}")
         if self._on_reply:
             self._on_reply(reply)
 
         self._speaking.set()
-        threading.Thread(target=self._speak_then_clear, args=(reply,), daemon=True).start()
+        threading.Thread(target=self._speak_then_clear, args=(spoken,), daemon=True).start()
 
     def _speak_then_clear(self, reply: str) -> None:
         try:
