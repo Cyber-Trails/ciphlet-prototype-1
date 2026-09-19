@@ -126,22 +126,37 @@ except VoiceUnavailableError as exc:
 print("Wake-word runtime OK (" + (path or "bundled pretrained models") + ")")
 PY
 
+# --- 8. Wire model paths into .env (idempotent — never overwrites your config) ---
+# deploy/env_defaults.py adds a managed key only if it is missing, fills it only
+# if its value is blank, and leaves any non-empty value, unrelated key, secret,
+# or comment byte-for-byte untouched. CIPHLET_WAKE_MODEL is only touched when a
+# trained hey_ciphlet.onnx actually exists; otherwise it is left exactly as-is.
+echo
+echo "-- Updating .env (missing/blank voice keys only) --"
+if [ ! -f .env ]; then
+    if [ -f .env.example ]; then
+        cp .env.example .env
+        echo "Created .env from .env.example (none existed)."
+    else
+        : > .env
+        echo "Created empty .env (none existed)."
+    fi
+fi
+python3 deploy/env_defaults.py --env .env \
+    --set "CIPHLET_PIPER_MODEL=$PIPER_ONNX" \
+    --set "CIPHLET_VOSK_MODEL_PATH=$VOSK_DIR" \
+    --set-if-file "CIPHLET_WAKE_MODEL=$WAKE_MODEL"
+
 echo
 echo "== Voice runtime setup complete =="
 echo
-echo "Add these to your .env (or edit the existing blank entries):"
-echo "  CIPHLET_PIPER_MODEL=$PIPER_ONNX"
-echo "  CIPHLET_VOSK_MODEL_PATH=$VOSK_DIR"
-if [ -f "$WAKE_MODEL" ]; then
-    echo "  CIPHLET_WAKE_MODEL=$WAKE_MODEL"
-    echo "  # Custom \"Hey Ciphlet\" model found and wired in."
-else
-    echo "  # CIPHLET_WAKE_MODEL left unset: no trained \"Hey Ciphlet\" model at"
-    echo "  # $WAKE_MODEL yet, so openWakeWord's generic pretrained"
-    echo "  # models load instead (test with \"hey jarvis\" / \"alexa\" for now)."
-    echo "  # To train a real \"Hey Ciphlet\" model: see deploy/wake_word/TRAINING.md"
-    echo "  # (it's a GPU-class job — run on Colab, not here — then place the"
-    echo "  # resulting file at $WAKE_MODEL and re-run this script)."
+echo ".env is configured for voice (existing non-empty values were preserved)."
+if [ ! -f "$WAKE_MODEL" ]; then
+    echo "No trained \"Hey Ciphlet\" model at $WAKE_MODEL yet, so CIPHLET_WAKE_MODEL"
+    echo "was left alone and openWakeWord's generic pretrained models load instead"
+    echo "(test with \"hey jarvis\" / \"alexa\" for now). To train a real one, see"
+    echo "deploy/wake_word/TRAINING.md (GPU-class job — run on Colab, not here),"
+    echo "place the result at $WAKE_MODEL, and re-run this script."
 fi
 echo
 echo "Mic/speaker device selection (only needed if the Pi's default audio"

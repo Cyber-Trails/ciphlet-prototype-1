@@ -94,7 +94,7 @@ echo
 echo "Optional: for voice (mic/speaker), also run:"
 echo "  bash deploy/install_voice.sh"
 echo "  # installs voice extras + downloads the Piper/VOSK/openWakeWord"
-echo "  # model files and prints the .env lines to set."
+echo "  # model files and fills in missing/blank voice keys in .env."
 echo
 echo "Start Ciphlet:"
 echo "  source .venv/bin/activate && ciphlet chat"
