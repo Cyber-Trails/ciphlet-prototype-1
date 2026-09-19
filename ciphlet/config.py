@@ -77,6 +77,11 @@ class Config:
     # `aplay -L` (speaker). Unset uses each subsystem's own default.
     audio_input_device: str | int | None
     audio_output_device: str | None
+    # Consecutive 30ms speech frames needed to interrupt Ciphlet mid-reply
+    # (barge-in, §4.6). 0 disables barge-in — use if the speaker is audible
+    # in the mic and keeps cutting replies off (`ciphlet voice --selftest`
+    # measures this and recommends a value).
+    barge_in_frames: int
 
     @classmethod
     def load(cls) -> "Config":
@@ -103,6 +108,7 @@ class Config:
             vosk_model_path=os.environ.get("CIPHLET_VOSK_MODEL_PATH"),
             audio_input_device=_parse_audio_device(os.environ.get("CIPHLET_AUDIO_INPUT_DEVICE")),
             audio_output_device=os.environ.get("CIPHLET_AUDIO_OUTPUT_DEVICE") or None,
+            barge_in_frames=int(os.environ.get("CIPHLET_BARGE_IN_FRAMES") or "3"),
         )
 
 

@@ -15,7 +15,10 @@ message and the caller (main.py) falls back to text mode rather than crashing.
 
 from __future__ import annotations
 
+import re
+import sys
 import threading
+from collections import deque
 from math import gcd
 from typing import Callable
 
@@ -29,6 +32,11 @@ SAMPLE_RATE = 16000
 FRAME_MS = 30
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000  # 480 samples/frame — valid webrtcvad frame size
 SILENCE_FRAMES_TO_STOP = 20  # ~600ms of silence ends an utterance
+NO_SPEECH_TIMEOUT_FRAMES = 200  # ~6s: give up if nothing is said after the wake word
+MAX_UTTERANCE_FRAMES = 500  # ~15s hard cap on one utterance
+POST_SPEECH_HOLDOFF_FRAMES = 15  # ~450ms of mic ignored after TTS ends, so room echo can't re-trigger wake
+ECHO_MIN_WORDS = 3  # a shorter transcript is never treated as Ciphlet hearing itself
+ECHO_OVERLAP = 0.8  # fraction of transcript words found in Ciphlet's last reply => it heard itself
 
 # openWakeWord expects ~80ms (1280-sample @16kHz) windows, not the 480-sample
 # VAD frame size above — feeding it undersized frames (an earlier known gap
@@ -227,6 +235,17 @@ def _open_input_stream(device: str | int | None):
     )
 
 
+def _is_self_echo(heard: str, last_reply: str) -> bool:
+    """True if `heard` is (nearly) just Ciphlet's own last reply coming back in
+    through the mic — with no hardware echo cancellation, barge-in can trigger
+    on its own TTS and would otherwise transcribe and answer itself."""
+    words = re.findall(r"[a-z0-9']+", heard.lower())
+    if len(words) < ECHO_MIN_WORDS or not last_reply:
+        return False
+    reply_words = set(re.findall(r"[a-z0-9']+", last_reply.lower()))
+    return sum(w in reply_words for w in words) / len(words) >= ECHO_OVERLAP
+
+
 class PTTVoiceSession:
     """Push-to-talk: press Enter, speak, press Enter again to send."""
 
@@ -291,6 +310,7 @@ class HandsFreeVoiceSession:
         on_utterance: Callable[[str], str],
         input_device: str | int | None = None,
         on_reply: Callable[[str], None] | None = None,
+        barge_in_frames: int = BARGE_IN_DEBOUNCE_FRAMES,
     ) -> None:
         self._audio = audio
         self._wake = wake
@@ -305,6 +325,10 @@ class HandsFreeVoiceSession:
         self._on_reply = on_reply
         self._speaking = threading.Event()
         self._wake_buffer = bytearray()
+        # Consecutive speech frames needed to interrupt TTS; 0 disables
+        # barge-in (use if the speaker bleeds into the mic — see --selftest).
+        self._barge_in_frames = barge_in_frames
+        self._last_reply = ""
 
     def _check_wake(self, conditioned: bytes) -> bool:
         """Accumulate VAD-sized frames into openWakeWord-sized windows
@@ -319,58 +343,101 @@ class HandsFreeVoiceSession:
                 detected = True
         return detected
 
+    def _reset_wake(self) -> None:
+        self._wake_buffer.clear()
+        self._wake.reset()
+
     def run_forever(self) -> None:
         print('Ciphlet is listening for "Hey Ciphlet"... (Ctrl+C to stop)')
         stream = _open_input_stream(self._input_device)
         speech_run = 0  # consecutive speech frames seen while Ciphlet is talking — see BARGE_IN_DEBOUNCE_FRAMES
+        recent: deque = deque(maxlen=max(self._barge_in_frames, 1))  # those frames, kept so the interruption isn't clipped
+        was_speaking = False
+        holdoff = 0
         try:
             while True:
                 chunk, _ = stream.read(FRAME_SAMPLES)
                 conditioned = self._audio.condition(chunk.tobytes())
 
                 if self._speaking.is_set():
+                    was_speaking = True
                     # Interruption path (§4.6): listen while Ciphlet talks,
                     # barge in once real speech is sustained (debounced
                     # against self-heard TTS bleed-through — see
                     # BARGE_IN_DEBOUNCE_FRAMES above; no hardware AEC here).
-                    if self._audio.is_speech(conditioned):
+                    if self._barge_in_frames > 0 and self._audio.is_speech(conditioned):
                         speech_run += 1
-                        if speech_run >= BARGE_IN_DEBOUNCE_FRAMES:
+                        recent.append(chunk.copy())
+                        if speech_run >= self._barge_in_frames:
                             self._tts.stop()
                             self._speaking.clear()
+                            self._respond(self._capture_utterance(stream, list(recent)), echo_guard=True)
                             speech_run = 0
-                            self._respond(self._capture_utterance(stream))
+                            recent.clear()
+                            was_speaking = False
+                            self._reset_wake()
                     else:
                         speech_run = 0
+                        recent.clear()
+                    continue
+
+                if was_speaking:  # playback just finished on its own
+                    was_speaking = False
+                    holdoff = POST_SPEECH_HOLDOFF_FRAMES
+                    self._reset_wake()
+                if holdoff > 0:
+                    holdoff -= 1
                     continue
 
                 speech_run = 0
                 if self._check_wake(conditioned):
                     print("(wake word detected)")
                     self._respond(self._capture_utterance(stream))
+                    self._reset_wake()
         finally:
             stream.stop()
             stream.close()
 
-    def _capture_utterance(self, stream) -> bytes:
+    def _capture_utterance(self, stream, prefix: list | None = None) -> bytes:
+        """Record until ~600ms of silence *after speech has started*. Waits up
+        to NO_SPEECH_TIMEOUT_FRAMES for the user to begin (so a pause after
+        the wake word doesn't lose the turn), and caps total length."""
         import numpy as np
 
-        frames = []
+        frames = list(prefix or [])
+        started = bool(frames)  # barge-in: the interrupting speech is already in `prefix`
+        waited = 0
         silence_run = 0
-        while silence_run < SILENCE_FRAMES_TO_STOP:
+        while len(frames) < MAX_UTTERANCE_FRAMES:
             chunk, _ = stream.read(FRAME_SAMPLES)
             conditioned = self._audio.condition(chunk.tobytes())
             frames.append(chunk.copy())
-            silence_run = 0 if self._audio.is_speech(conditioned) else silence_run + 1
+            if self._audio.is_speech(conditioned):
+                started = True
+                silence_run = 0
+            elif started:
+                silence_run += 1
+                if silence_run >= SILENCE_FRAMES_TO_STOP:
+                    break
+            else:
+                waited += 1
+                if waited >= NO_SPEECH_TIMEOUT_FRAMES:
+                    return b""  # never started talking
         return np.concatenate(frames, axis=0).tobytes() if frames else b""
 
-    def _respond(self, audio: bytes) -> None:
+    def _respond(self, audio: bytes, echo_guard: bool = False) -> None:
+        if not audio:
+            return
         text = self._stt.transcribe(audio)
         if not text:
+            return
+        if echo_guard and _is_self_echo(text, self._last_reply):
+            print("(ignored — that was my own voice coming back in through the mic)")
             return
 
         print(f"You: {text}")
         reply = self._on_utterance(text)
+        self._last_reply = reply
         print(f"Ciphlet: {reply}")
         if self._on_reply:
             self._on_reply(reply)
@@ -381,5 +448,7 @@ class HandsFreeVoiceSession:
     def _speak_then_clear(self, reply: str) -> None:
         try:
             self._tts.speak(reply)
+        except Exception as exc:  # runs in a thread: surface it instead of dying silently
+            print(f"(speech output failed: {exc})", file=sys.stderr)
         finally:
             self._speaking.clear()

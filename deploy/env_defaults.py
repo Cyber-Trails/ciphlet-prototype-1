@@ -74,6 +74,21 @@ def _split_value(rest: str) -> tuple[str, str]:
     return rest, ""
 
 
+def get_value(text: str, key: str) -> str:
+    """Effective value of `key` (last occurrence wins, like python-dotenv) with
+    surrounding quotes removed; "" if the key is absent or blank."""
+    pattern = _line_key_re(key)
+    value = ""
+    for line in text.splitlines():
+        m = pattern.match(line)
+        if m:
+            value, _ = _split_value(m.group("rest"))
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+    return value
+
+
 def apply_defaults(text: str, managed: dict[str, str]) -> tuple[str, dict[str, str]]:
     """Return (new_text, {key: 'added'|'filled'|'kept'}). Pure function."""
     lines = text.splitlines(keepends=True)

@@ -21,7 +21,9 @@ last_served), so that's observable in normal use without a debugger.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
+from pathlib import Path
 
 from ciphlet.brain import (
     BrainMode,
@@ -32,7 +34,7 @@ from ciphlet.brain import (
     OllamaBrainProvider,
     OpenRouterBrainProvider,
 )
-from ciphlet.config import Config
+from ciphlet.config import PROJECT_ROOT, Config
 from ciphlet.embodiment.state import EmbodimentSink
 from ciphlet.memory.store import MemoryStore
 from ciphlet.orchestrator import Orchestrator
@@ -160,8 +162,28 @@ def run_chat(args: argparse.Namespace) -> None:
             print(info)
 
 
+def _resolve_model_path(value: str | None) -> str | None:
+    """Model paths in .env may be relative (.env.example ships relative
+    defaults); resolve them against the project root so voice works no matter
+    which directory `ciphlet` is launched from."""
+    if not value:
+        return value
+    path = Path(value).expanduser()
+    return str(path if path.is_absolute() else PROJECT_ROOT / path)
+
+
 def run_voice(args: argparse.Namespace) -> None:
     config = Config.load()
+    config = dataclasses.replace(
+        config,
+        piper_model_path=_resolve_model_path(config.piper_model_path),
+        vosk_model_path=_resolve_model_path(config.vosk_model_path),
+        wake_model_path=_resolve_model_path(config.wake_model_path),
+    )
+    if getattr(args, "selftest", False):
+        from ciphlet.voice.selftest import run_selftest
+
+        sys.exit(run_selftest(config))
     orchestrator = _build_orchestrator(
         config,
         no_memory=args.no_memory,
@@ -210,7 +232,13 @@ def run_voice(args: argparse.Namespace) -> None:
                 orchestrator.handle_text,
                 input_device=config.audio_input_device,
                 on_reply=_print_brain_info,
+                barge_in_frames=config.barge_in_frames,
             )
+            if not config.wake_model_path:
+                print(
+                    'No custom "Hey Ciphlet" model is installed yet — wake it by saying '
+                    '"hey jarvis", "alexa", "hey mycroft" or "hey rhasspy".'
+                )
             session.run_forever()
         else:
             session = PTTVoiceSession(stt, tts, orchestrator.handle_text, input_device=config.audio_input_device)
@@ -269,6 +297,11 @@ def build_parser() -> argparse.ArgumentParser:
     mode = voice_parser.add_mutually_exclusive_group()
     mode.add_argument("--ptt", action="store_true", help="Push-to-talk (fallback/recovery, §4.1) [default]")
     mode.add_argument("--hands-free", action="store_true", help="Wake-word loop (primary interaction, §4.1)")
+    mode.add_argument(
+        "--selftest",
+        action="store_true",
+        help="Integrated hardware check of speaker, mic, VOSK, wake model and barge-in safety (run on the Pi)",
+    )
     voice_parser.set_defaults(func=run_voice)
 
     return parser

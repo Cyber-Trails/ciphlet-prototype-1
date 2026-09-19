@@ -36,8 +36,9 @@ echo
 echo "-- Installing system packages (sudo apt) --"
 sudo apt-get update -y
 # build-essential + python3-dev: webrtcvad ships sdist-only (no wheels), so pip
-# compiles its C extension against the venv Python's headers.
-sudo apt-get install -y unzip build-essential python3-dev
+# compiles its C extension against the venv Python's headers. alsa-utils:
+# aplay/amixer/arecord for speaker playback, detection and volume.
+sudo apt-get install -y unzip build-essential python3-dev alsa-utils
 
 # --- 2. Python voice extras (sounddevice, vosk, webrtcvad, piper-tts + openWakeWord's ONNX-path deps) ---
 echo
@@ -147,6 +148,15 @@ python3 deploy/env_defaults.py --env .env \
     --set "CIPHLET_VOSK_MODEL_PATH=$VOSK_DIR" \
     --set-if-file "CIPHLET_WAKE_MODEL=$WAKE_MODEL"
 
+# --- 9. Speaker: detect, unmute, verify playback, record in .env ---
+# deploy/audio_setup.py picks the playback card (USB first), unmutes/raises its
+# volume only where muted or low, plays a short beep through a plughw: route
+# (so ALSA converts rates for speakers that only do 44.1/48 kHz), and writes
+# CIPHLET_AUDIO_OUTPUT_DEVICE only if it is missing/blank. Never fails the install.
+echo
+echo "-- Setting up the speaker (you should hear a short beep) --"
+python3 deploy/audio_setup.py --env .env || echo "(speaker auto-setup skipped; 'ciphlet voice --selftest' will diagnose)"
+
 echo
 echo "== Voice runtime setup complete =="
 echo
@@ -163,9 +173,20 @@ echo "Mic/speaker device selection (only needed if the Pi's default audio"
 echo "device isn't the mic/speaker you want to use):"
 echo "  CIPHLET_AUDIO_INPUT_DEVICE=   # list mics: python3 -m sounddevice"
 echo "  CIPHLET_AUDIO_OUTPUT_DEVICE=  # list speakers: aplay -L"
+
+# --- 10. Integrated hardware self-test (speaker + mic + VOSK + wake + barge-in) ---
+# Interactive (you listen, then speak), so only offered when run from a terminal.
+if [ -t 0 ]; then
+    echo
+    read -r -p "Run the integrated voice self-test now? [Y/n] " REPLY_YN || REPLY_YN="n"
+    case "$REPLY_YN" in
+        [nN]*) ;;
+        *) python3 -m ciphlet voice --selftest || true ;;
+    esac
+fi
+
 echo
-echo "Test push-to-talk (simplest bring-up path, §24 Stage 1-2):"
-echo "  source .venv/bin/activate && ciphlet voice --ptt"
-echo
-echo "Test hands-free (wake word + VAD + barge-in):"
-echo "  source .venv/bin/activate && ciphlet voice --hands-free"
+echo "Voice commands (activate the venv first: source .venv/bin/activate):"
+echo "  ciphlet voice --selftest     # integrated check: speaker, mic, VOSK, wake, barge-in safety"
+echo "  ciphlet voice --ptt          # push-to-talk"
+echo "  ciphlet voice --hands-free   # wake word + listen + reply + barge-in"

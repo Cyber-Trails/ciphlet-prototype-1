@@ -37,6 +37,10 @@ class WakeProvider(ABC):
     def detect(self, audio_chunk: bytes) -> bool:
         """Does this chunk contain the wake phrase ("Hey Ciphlet")?"""
 
+    def reset(self) -> None:
+        """Forget buffered audio/scores (e.g. after a turn, so the wake phrase
+        or TTS echo from before it can't re-trigger). Optional; no-op default."""
+
 
 class STTProvider(ABC):
     @abstractmethod
