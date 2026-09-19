@@ -16,10 +16,15 @@ message and the caller (main.py) falls back to text mode rather than crashing.
 from __future__ import annotations
 
 import threading
+from math import gcd
 from typing import Callable
 
 from ciphlet.voice.base import AudioProcessor, STTProvider, TTSProvider, VoiceUnavailableError, WakeProvider
 
+# Canonical rate of everything downstream of capture: webrtcvad (480-sample /
+# 30 ms frames), openWakeWord (16 kHz, 1280-sample windows), and VOSK
+# (KaldiRecognizer(model, 16000)). Capture hardware is NOT required to run at
+# this rate — see _open_input_stream, which resamples to it when needed.
 SAMPLE_RATE = 16000
 FRAME_MS = 30
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000  # 480 samples/frame — valid webrtcvad frame size
@@ -54,20 +59,172 @@ def _get_sounddevice():
     return sd
 
 
+# Capture rates tried, in order, when opening the mic. 16 kHz first: if the
+# device (or an ALSA plug/pulse route) already supports it, nothing extra is
+# needed and behavior is exactly as before. USB mics often expose only 44.1/48
+# kHz (e.g. `arecord --dump-hw-params` -> RATE: [44100 48000]); 48 kHz is a
+# clean 3:1 to 16 kHz, so it is preferred over 44.1. The device's own default
+# rate is tried last.
+_CAPTURE_RATE_CANDIDATES = (SAMPLE_RATE, 48000, 44100)
+_PA_INVALID_SAMPLE_RATE = -9997  # PortAudio paInvalidSampleRate
+
+_input_rate_cache: dict = {}  # device -> rate that last opened successfully
+_announced_rates: set = set()
+
+
+class _StreamResampler:
+    """Stateful mono int16 sample-rate converter (streaming, numpy only).
+
+    Band-limited (Kaiser-windowed sinc) interpolation with the filter state
+    carried across calls, so feeding audio in arbitrary block sizes yields the
+    same output as one big call — no per-chunk edge glitches, which would
+    otherwise recur every 30 ms and hurt VAD/wake/STT. The cutoff sits just
+    under the output Nyquist so content above it is filtered out rather than
+    aliased down into the speech band. Cost is a few tens of thousands of
+    multiply-adds per 30 ms frame — negligible next to the models.
+    """
+
+    _ZERO_CROSSINGS = 8
+    _KAISER_BETA = 8.0
+    _CUTOFF = 0.91  # fraction of the output Nyquist
+
+    def __init__(self, in_rate: int, out_rate: int) -> None:
+        import numpy as np
+
+        g = gcd(in_rate, out_rate)
+        self._up = out_rate // g
+        self._down = in_rate // g
+        fc = 0.5 * min(1.0, out_rate / in_rate) * self._CUTOFF  # cycles per input sample
+        half = int(np.ceil(self._ZERO_CROSSINGS / (2 * fc)))  # filter half-width, in input samples
+        self._half = half
+        self._taps = np.arange(-half + 1, half + 1)
+        # One weight row per fractional phase (out sample n sits at input time
+        # n*down/up; the fractional part repeats every `up` outputs).
+        tau = (np.arange(self._up)[:, None] / self._up) - self._taps[None, :]
+        window = np.i0(self._KAISER_BETA * np.sqrt(np.clip(1.0 - (tau / half) ** 2, 0.0, None))) / np.i0(self._KAISER_BETA)
+        weights = 2 * fc * np.sinc(2 * fc * tau) * window
+        weights /= weights.sum(axis=1, keepdims=True)  # exact unity DC gain per phase
+        self._weights = weights.astype(np.float32)
+        self._buf = np.zeros(half, dtype=np.float32)  # history; index 0 is input time _buf_start
+        self._buf_start = -half
+        self._next = 0  # index of the next output sample to produce
+
+    def process(self, samples):
+        """Feed a 1-D int16 block; return the newly available 1-D int16 output."""
+        import numpy as np
+
+        half, up, down = self._half, self._up, self._down
+        self._buf = np.concatenate((self._buf, samples.astype(np.float32)))
+        total = self._buf_start + len(self._buf)
+        # Emit only outputs whose full filter support (up to `half` samples
+        # ahead) has arrived — a fixed, sub-millisecond latency.
+        last = ((total - half) * up - 1) // down
+        if last < self._next:
+            return np.zeros(0, dtype=np.int16)
+        n = np.arange(self._next, last + 1, dtype=np.int64)
+        pos = n * down
+        base, phase = pos // up, pos % up
+        gathered = self._buf[(base - self._buf_start)[:, None] + self._taps[None, :]]
+        out = (gathered * self._weights[phase]).sum(axis=1)
+        self._next = last + 1
+        drop = (self._next * down) // up - half + 1 - self._buf_start
+        if drop > 0:
+            self._buf = self._buf[drop:]
+            self._buf_start += drop
+        return np.clip(np.rint(out), -32768, 32767).astype(np.int16)
+
+
+class _ResamplingInputStream:
+    """Wraps a sounddevice InputStream that captures at `in_rate` and exposes
+    the same read/stop/close surface at SAMPLE_RATE, so the pipeline's readers
+    (which ask for FRAME_SAMPLES 16 kHz frames) don't change."""
+
+    def __init__(self, stream, in_rate: int, out_rate: int = SAMPLE_RATE) -> None:
+        import numpy as np
+
+        self._stream = stream
+        self._in_rate = in_rate
+        self._out_rate = out_rate
+        self._resampler = _StreamResampler(in_rate, out_rate)
+        self._pending = np.zeros(0, dtype=np.int16)  # resampled, not yet returned
+
+    def read(self, frames: int):
+        import numpy as np
+
+        native = -(-frames * self._in_rate // self._out_rate)  # ceil
+        overflowed = False
+        while len(self._pending) < frames:
+            data, over = self._stream.read(native)
+            overflowed = overflowed or bool(over)
+            self._pending = np.concatenate((self._pending, self._resampler.process(data.reshape(-1))))
+        out = self._pending[:frames].reshape(-1, 1).copy()
+        self._pending = self._pending[frames:]
+        return out, overflowed
+
+    def stop(self) -> None:
+        self._stream.stop()
+
+    def close(self) -> None:
+        self._stream.close()
+
+
+def _is_invalid_sample_rate(exc: Exception) -> bool:
+    return _PA_INVALID_SAMPLE_RATE in exc.args[1:2] or "Invalid sample rate" in str(exc)
+
+
+def _capture_rate_candidates(sd, device) -> list[int]:
+    rates: list[int] = []
+    if device in _input_rate_cache:
+        rates.append(_input_rate_cache[device])
+    rates.extend(_CAPTURE_RATE_CANDIDATES)
+    try:
+        rates.append(int(sd.query_devices(device, "input")["default_samplerate"]))
+    except Exception:
+        pass  # no/invalid device: opening below reports it properly
+    return list(dict.fromkeys(rates))
+
+
 def _open_input_stream(device: str | int | None):
-    """Open+start a mono 16-bit input stream, converting a PortAudio-level
-    failure (no mic, wrong device, device busy) into a clear, actionable
+    """Open+start a mono 16-bit input stream that delivers SAMPLE_RATE audio.
+
+    The microphone is opened at a rate it actually supports (see
+    _CAPTURE_RATE_CANDIDATES) and, if that isn't 16 kHz, resampled to 16 kHz —
+    the format the VAD, wake-word model and STT require. A PortAudio-level
+    failure (no mic, wrong device, device busy) becomes a clear, actionable
     VoiceUnavailableError instead of a raw driver traceback."""
     sd = _get_sounddevice()
-    try:
-        stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", device=device)
-        stream.start()
-    except sd.PortAudioError as exc:
-        raise VoiceUnavailableError(
-            f"Could not open audio input device ({exc}). Check the microphone is connected, or set "
-            "CIPHLET_AUDIO_INPUT_DEVICE — list devices with 'python3 -m sounddevice'."
-        ) from exc
-    return stream
+    tried: list[int] = []
+    for rate in _capture_rate_candidates(sd, device):
+        stream = None
+        try:
+            stream = sd.InputStream(samplerate=rate, channels=1, dtype="int16", device=device)
+            stream.start()
+        except sd.PortAudioError as exc:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            if _is_invalid_sample_rate(exc):
+                tried.append(rate)  # this rate isn't supported by the device; try the next
+                continue
+            raise VoiceUnavailableError(
+                f"Could not open audio input device ({exc}). Check the microphone is connected, or set "
+                "CIPHLET_AUDIO_INPUT_DEVICE — list devices with 'python3 -m sounddevice'."
+            ) from exc
+        _input_rate_cache[device] = rate
+        if rate == SAMPLE_RATE:
+            return stream
+        if (device, rate) not in _announced_rates:
+            _announced_rates.add((device, rate))
+            print(f"(audio input opened at {rate} Hz — the device doesn't support {SAMPLE_RATE} Hz; resampling)")
+        return _ResamplingInputStream(stream, rate)
+    where = f"'{device}'" if device is not None else "the default input device"
+    raise VoiceUnavailableError(
+        f"Audio input device {where} rejected every sample rate Ciphlet tried ({', '.join(map(str, tried))} Hz). "
+        "Check what it supports (e.g. 'arecord --dump-hw-params -D hw:2,0 /dev/null') and select the right "
+        "microphone with CIPHLET_AUDIO_INPUT_DEVICE — list devices with 'python3 -m sounddevice'."
+    )
 
 
 class PTTVoiceSession:
