@@ -82,6 +82,10 @@ class Config:
     # in the mic and keeps cutting replies off (`ciphlet voice --selftest`
     # measures this and recommends a value).
     barge_in_frames: int
+    # Loudness gate for barge-in: an interruption must also be this many times
+    # louder than the echo of Ciphlet's own voice at the mic (`ciphlet voice
+    # --selftest` measures the echo and recommends a value). 0 = VAD only.
+    barge_in_gate: float
     # Wake engine: "auto" (default) = trained custom model if CIPHLET_WAKE_MODEL
     # is set, else the PocketSphinx "Hey Ciphlet" phrase; "pocketsphinx" or
     # "openwakeword" force one (openwakeword = generic "hey jarvis"/"alexa"
@@ -115,6 +119,7 @@ class Config:
             audio_input_device=_parse_audio_device(os.environ.get("CIPHLET_AUDIO_INPUT_DEVICE")),
             audio_output_device=os.environ.get("CIPHLET_AUDIO_OUTPUT_DEVICE") or None,
             barge_in_frames=int(os.environ.get("CIPHLET_BARGE_IN_FRAMES") or "3"),
+            barge_in_gate=float(os.environ.get("CIPHLET_BARGE_IN_GATE") or "2.5"),
             wake_engine=(os.environ.get("CIPHLET_WAKE_ENGINE") or "auto").strip().lower(),
             wake_kws_threshold=float(os.environ.get("CIPHLET_WAKE_KWS_THRESHOLD") or "1e-20"),
         )

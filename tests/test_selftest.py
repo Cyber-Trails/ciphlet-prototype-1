@@ -27,10 +27,21 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(selftest.longest_run([0, 1, 1, 0, 1, 1, 1, 0]), 3)
         self.assertEqual(selftest.longest_run([]), 0)
 
-    def test_barge_in_recommendation(self):
-        self.assertEqual(selftest.recommend_barge_in(1, 3), 3)  # already clears the bleed
-        self.assertEqual(selftest.recommend_barge_in(5, 3), 8)  # short bleed: add headroom
-        self.assertEqual(selftest.recommend_barge_in(60, 3), 0)  # sustained bleed: disable
+    def test_would_interrupt_only_on_speech_much_louder_than_the_echo(self):
+        warm = pipeline.BARGE_IN_WARMUP_FRAMES
+        echo = [(True, 300.0)] * (warm + 100)  # VAD says "speech" throughout, but never louder than the echo
+        self.assertFalse(selftest.would_interrupt(echo, 3, 2.5))
+        surge = echo + [(True, 1200.0)] * 5  # 4x the echo
+        self.assertTrue(selftest.would_interrupt(surge, 3, 2.5))
+        self.assertFalse(selftest.would_interrupt(surge, 3, 5.0))
+
+    def test_gate_recommendation(self):
+        warm = pipeline.BARGE_IN_WARMUP_FRAMES
+        surge_4x = [(True, 300.0)] * warm + [(True, 1200.0)] * 5
+        self.assertEqual(selftest.recommend_gate(surge_4x, 3, 2.5), 5.0)  # smallest gate that clears it
+        self.assertEqual(selftest.recommend_gate([(True, 300.0)] * (warm + 50), 3, 2.5), 2.5)  # already fine
+        surge_20x = [(True, 300.0)] * warm + [(True, 6000.0)] * 5
+        self.assertIsNone(selftest.recommend_gate(surge_20x, 3, 2.5))  # nothing helps: disable barge-in
 
 
 @unittest.skipIf(np is None, "numpy not installed")
@@ -45,19 +56,25 @@ class RunSelftestTests(unittest.TestCase):
         self.config = SimpleNamespace(
             audio_input_device="hw:2,0", audio_output_device="plughw:CARD=Device,DEV=0",
             piper_model_path=str(d / "v.onnx"), vosk_model_path=str(d / "vosk"),
-            wake_model_path=None, barge_in_frames=3,
+            wake_model_path=None, barge_in_frames=3, barge_in_gate=2.5,
         )
 
-    def providers(self, mic_level=3000, heard="hello ciphlet", echo_is_speech=False, speak_error=None):
-        state = {"echo": False}
+    def providers(self, mic_level=3000, heard="hello ciphlet", echo_is_speech=False, speak_error=None, echo_amps=None):
+        state = {"echo": False, "n": 0}
 
         class TTS:
             def speak(_, text):
                 if speak_error:
                     raise speak_error
-                state["echo"] = text == selftest.ECHO_PHRASE
                 import time
-                time.sleep(0.05)
+                state["echo"] = text == selftest.ECHO_PHRASE
+                if state["echo"] and echo_amps is not None:
+                    state["n"] = 0
+                    deadline = time.time() + 5
+                    while state["n"] < pipeline.BARGE_IN_WARMUP_FRAMES + 60 and time.time() < deadline:
+                        time.sleep(0.001)  # keep "speaking" until the recorder has read enough frames
+                else:
+                    time.sleep(0.05)
                 state["echo"] = False
 
             def stop(_): pass
@@ -75,7 +92,11 @@ class RunSelftestTests(unittest.TestCase):
             def reset(_): pass
 
         class Stream:
-            def read(_, n): return np.full((n, 1), mic_level, dtype=np.int16), False
+            def read(_, n):
+                if state["echo"] and echo_amps is not None:  # loudness profile of Ciphlet's own voice at the mic
+                    state["n"] += 1
+                    return np.full((n, 1), echo_amps(state["n"]), dtype=np.int16), False
+                return np.full((n, 1), mic_level, dtype=np.int16), False
             def stop(_): pass
             def close(_): pass
 
@@ -99,19 +120,67 @@ class RunSelftestTests(unittest.TestCase):
         self.assertIn("[FAIL] speaker", out)
         self.assertIn("busy", out)
 
-    def test_silent_mic_fails_with_gain_advice(self):
-        code, out = self.run_it(mic_level=3)
+    def test_silent_mic_fails_with_gain_advice_when_a_human_was_prompted(self):
+        kw = self.providers(mic_level=3)
+        kw["interactive"] = True
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = selftest.run_selftest(self.config, ask=lambda prompt: "", **kw)
         self.assertEqual(code, 1)
-        self.assertIn("alsamixer", out)
+        self.assertIn("alsamixer", out.getvalue())
+
+    def test_silent_mic_is_only_a_warning_when_nobody_was_asked_to_speak(self):
+        # Real Pi run over ssh with no human: a quiet room must not FAIL the run
+        # or skip the speaker->mic bleed stage.
+        code, out = self.run_it(mic_level=3)
+        self.assertEqual(code, 0, out)
+        self.assertIn("[WARN] microphone", out)
+        self.assertIn("barge-in", out)
+        self.assertNotIn("skipped", out)
+
+    def test_unusable_vad_is_reported_as_a_failure_not_a_crash(self):
+        # Real Pi failure: webrtcvad raised VoiceUnavailableError (pkg_resources missing)
+        # and the self-test died with a traceback instead of reporting it.
+        kw = self.providers()
+
+        class BrokenAudio:
+            def condition(_, b): return b
+            def is_speech(_, b): raise VoiceUnavailableError("'webrtcvad' is not installed.")
+
+        kw["audio"] = BrokenAudio()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = selftest.run_selftest(self.config, **kw)
+        self.assertEqual(code, 1)
+        self.assertIn("[FAIL] VAD/VOSK", out.getvalue())
+        self.assertIn("webrtcvad", out.getvalue())
 
     def test_no_transcript_is_a_warning_not_a_failure(self):
         code, out = self.run_it(heard="")
         self.assertEqual(code, 0)
         self.assertIn("[WARN] microphone", out)
 
-    def test_speaker_bleed_into_mic_yields_a_barge_in_recommendation(self):
-        code, out = self.run_it(echo_is_speech=True)
+    def bleed(self, echo_amps):
+        return self.run_it(echo_is_speech=True, echo_amps=echo_amps)
+
+    def test_echo_that_never_exceeds_itself_does_not_interrupt_as_configured(self):
+        # VAD flags Ciphlet's own voice as speech throughout (the real Pi case), but the
+        # loudness gate means it can never interrupt itself.
+        code, out = self.bleed(lambda i: 300)
+        self.assertEqual(code, 0)
+        self.assertIn("[PASS] barge-in", out)
+        self.assertIn("does not interrupt it", out)
+
+    def test_a_surging_echo_gets_a_gate_recommendation(self):
+        warm = pipeline.BARGE_IN_WARMUP_FRAMES
+        code, out = self.bleed(lambda i: 300 if i <= warm else 1200)  # 4x surge
         self.assertEqual(code, 0)  # advice, not a failure
+        self.assertIn("[WARN] barge-in", out)
+        self.assertIn("CIPHLET_BARGE_IN_GATE=5", out)
+
+    def test_an_echo_no_gate_can_separate_recommends_disabling_barge_in(self):
+        warm = pipeline.BARGE_IN_WARMUP_FRAMES
+        code, out = self.bleed(lambda i: 300 if i <= warm else 6000)  # 20x surge
         self.assertIn("[WARN] barge-in", out)
         self.assertIn("CIPHLET_BARGE_IN_FRAMES=0", out)
 
@@ -139,7 +208,7 @@ class WakePhraseStageTests(unittest.TestCase):
         (d / "vosk").mkdir()
         self.config = SimpleNamespace(
             audio_input_device=None, audio_output_device=None, piper_model_path=str(d / "v.onnx"),
-            vosk_model_path=str(d / "vosk"), wake_model_path=None, barge_in_frames=3,
+            vosk_model_path=str(d / "vosk"), wake_model_path=None, barge_in_frames=3, barge_in_gate=2.5,
         )
 
     def run_it(self, wake_behaviour):
@@ -147,7 +216,7 @@ class WakePhraseStageTests(unittest.TestCase):
             def speak(_, text): pass
             def stop(_): pass
             def synthesize(_, text):  # loud only for the wake phrase
-                amp = 1000 if text == "hey ciphlet" else 0
+                amp = 1000 if text == "hey sigh flit" else 0
                 return np.full(22050, amp, dtype=np.int16).tobytes(), 22050
 
         class Audio:

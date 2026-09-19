@@ -23,7 +23,6 @@ ECHO_PHRASE = (
 )
 RECORD_SECONDS = 4
 LOW_LEVEL_PEAK = 500  # int16 peak below this = mic is barely picking anything up
-MAX_DEBOUNCE_WORTH_TRYING = 15  # ~450 ms; longer self-heard runs can't be debounced away
 
 
 def longest_run(flags) -> int:
@@ -34,16 +33,21 @@ def longest_run(flags) -> int:
     return best
 
 
-def recommend_barge_in(longest_echo_run: int, current: int) -> int:
-    """Barge-in frames that stop the speaker's own bleed triggering an
-    interruption: keep `current` if it already clears the measured bleed, add a
-    little headroom over a short bleed, and disable (0) if the bleed is
-    sustained (no debounce can separate that from a real interruption)."""
-    if longest_echo_run < current:
-        return current
-    if longest_echo_run <= MAX_DEBOUNCE_WORTH_TRYING:
-        return longest_echo_run + 3
-    return 0
+def would_interrupt(pairs, frames: int, gate: float) -> bool:
+    """Would the real barge-in detector have fired on this recording of
+    Ciphlet's own voice? `pairs` = [(vad_speech, frame_rms), ...]."""
+    detector = pipeline.BargeInDetector(frames, gate, pipeline.BARGE_IN_WARMUP_FRAMES)
+    return any(detector.update(speech, rms) for speech, rms in pairs)
+
+
+def recommend_gate(pairs, frames: int, gate: float) -> float | None:
+    """Smallest gate at or above `gate` that stops Ciphlet's own echo from
+    interrupting it; None if even a very high gate doesn't (the echo is louder
+    than a person would be, so barge-in should be disabled)."""
+    for candidate in (gate, 3.5, 5.0, 8.0, 12.0):
+        if candidate >= gate and not would_interrupt(pairs, frames, candidate):
+            return candidate
+    return None
 
 
 def _phrase_pcm_16k(tts, text: str) -> bytes:
@@ -62,6 +66,7 @@ def _phrase_pcm_16k(tts, text: str) -> bytes:
 def wake_fires(wake, pcm: bytes) -> bool:
     """Feed 80 ms windows of `pcm` to the wake engine; did it ever fire?"""
     step = pipeline.WAKE_CHUNK_SAMPLES * 2
+    wake = wake.fresh() if hasattr(wake, "fresh") else wake
     wake.reset()
     hit = False
     for i in range(0, len(pcm) - step + 1, step):
@@ -189,10 +194,19 @@ def run_selftest(
             stream.stop()
             stream.close()
         peak, rms = _levels(frames_16k)
-        speech_frames = sum(audio.is_speech(audio.condition(f.tobytes())) for f in frames_16k)
-        text = stt.transcribe(b"".join(f.tobytes() for f in frames_16k))
+        try:
+            speech_frames = sum(audio.is_speech(audio.condition(f.tobytes())) for f in frames_16k)
+            text = stt.transcribe(b"".join(f.tobytes() for f in frames_16k))
+        except VoiceUnavailableError as exc:  # VAD or VOSK not usable: report, don't crash
+            mic_ok = False
+            report.add("FAIL", "VAD/VOSK", f"captured audio (peak {peak}, rms {rms:.0f}) but processing failed: {exc}")
+            speech_frames, text = None, None
         detail = f"peak {peak}, rms {rms:.0f}, speech in {speech_frames}/{len(frames_16k)} frames; VOSK heard: {text!r}"
-        if peak < LOW_LEVEL_PEAK:
+        if text is None:
+            pass
+        elif peak < LOW_LEVEL_PEAK and not interactive:
+            report.add("WARN", "microphone", detail + " — nothing loud enough was heard (non-interactive run: nobody was prompted to speak)")
+        elif peak < LOW_LEVEL_PEAK:
             mic_ok = False
             report.add("FAIL", "microphone", detail + " — signal is almost silent: raise capture gain (alsamixer -c <card>, F4) or check the mic")
         elif not text:
@@ -220,7 +234,9 @@ def run_selftest(
             # other speech)? Uses Piper-synthesized speech, so it needs no human
             # and is repeatable; real voices still vary — see the hands-free test.
             if hasattr(tts, "synthesize") and speaker_ok:
-                positive = "hey jarvis" if "jarvis" in wake_label else "hey ciphlet"
+                # Spelled as the SPEC pronounces it (SIGH-flit): Piper reads "ciphlet" as
+                # "SIF-let", which is not how the owner says it.
+                positive = "hey jarvis" if "jarvis" in wake_label else "hey sigh flit"
                 try:
                     hit = wake_fires(wake, _phrase_pcm_16k(tts, positive))
                     false_hits = [t for t in (SPEAKER_PHRASE, ECHO_PHRASE) if wake_fires(wake, _phrase_pcm_16k(tts, t))]
@@ -243,24 +259,34 @@ def run_selftest(
             stream = open_stream(config.audio_input_device)
             speaker = threading.Thread(target=lambda: _safe_speak(tts, ECHO_PHRASE), daemon=True)
             speaker.start()
-            flags = []
+            pairs = []
             try:
+                import numpy as np
+
                 while speaker.is_alive():
                     chunk, _ = stream.read(pipeline.FRAME_SAMPLES)
-                    flags.append(bool(audio.is_speech(audio.condition(chunk.tobytes()))))
+                    rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+                    pairs.append((bool(audio.is_speech(audio.condition(chunk.tobytes()))), rms))
             finally:
                 stream.stop()
                 stream.close()
-            run = longest_run(flags)
-            current = config.barge_in_frames
-            rec = recommend_barge_in(run, current)
-            detail = f"own voice reached the mic as speech for up to {run} consecutive frames ({run * pipeline.FRAME_MS} ms); barge-in threshold is {current}"
-            if run < current:
-                report.add("PASS", "barge-in", detail + " — safe as configured")
-            elif rec == 0:
-                report.add("WARN", "barge-in", detail + " — sustained: set CIPHLET_BARGE_IN_FRAMES=0 in .env (or use headphones / move the speaker away from the mic)")
+            run = longest_run([speech for speech, _ in pairs])
+            echo_rms = max((r for _, r in pairs), default=0.0)
+            frames, gate = config.barge_in_frames, config.barge_in_gate
+            detail = (
+                f"own voice reached the mic as speech for up to {run} consecutive frames ({run * pipeline.FRAME_MS} ms), "
+                f"echo peak rms {echo_rms:.0f}; barge-in needs {frames} frames >= {gate:g}x the echo"
+            )
+            if frames <= 0:
+                report.add("PASS", "barge-in", detail + " — barge-in is disabled (CIPHLET_BARGE_IN_FRAMES=0)")
+            elif not would_interrupt(pairs, frames, gate):
+                report.add("PASS", "barge-in", detail + " — Ciphlet's own voice does not interrupt it as configured")
             else:
-                report.add("WARN", "barge-in", detail + f" — set CIPHLET_BARGE_IN_FRAMES={rec} in .env")
+                rec = recommend_gate(pairs, frames, gate)
+                if rec is None:
+                    report.add("WARN", "barge-in", detail + " — the echo is too loud to tell from a person: set CIPHLET_BARGE_IN_FRAMES=0 in .env, or use headphones / a speakerphone with echo cancellation / move the speaker away from the mic")
+                else:
+                    report.add("WARN", "barge-in", detail + f" — Ciphlet would interrupt itself: set CIPHLET_BARGE_IN_GATE={rec:g} in .env")
         except VoiceUnavailableError as exc:
             report.add("WARN", "barge-in", f"could not measure: {exc}")
 

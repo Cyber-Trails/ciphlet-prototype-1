@@ -37,12 +37,24 @@ class WakeProvider(ABC):
     def detect(self, audio_chunk: bytes) -> bool:
         """Does this chunk contain the wake phrase ("Hey Ciphlet")?"""
 
+    def fresh(self) -> "WakeProvider":
+        """An independent instance with no adapted/buffered audio state (for
+        repeatable tests). Default: self."""
+        return self
+
+    def load(self) -> None:
+        """Load models now (called before the mic opens) so the first seconds of
+        audio aren't lost while a lazily-loaded model initialises. Optional."""
+
     def reset(self) -> None:
         """Forget buffered audio/scores (e.g. after a turn, so the wake phrase
         or TTS echo from before it can't re-trigger). Optional; no-op default."""
 
 
 class STTProvider(ABC):
+    def load(self) -> None:
+        """Load the model now instead of on the first utterance. Optional."""
+
     @abstractmethod
     def transcribe(self, audio: bytes) -> str:
         """Transcribe a captured utterance to text."""

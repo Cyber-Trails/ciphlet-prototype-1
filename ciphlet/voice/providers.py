@@ -47,7 +47,12 @@ class WebRTCVadAudioProcessor(AudioProcessor):
     def _get_vad(self):
         if self._vad is None:
             try:
-                import webrtcvad
+                import warnings
+
+                with warnings.catch_warnings():
+                    # webrtcvad imports pkg_resources, which warns it is deprecated (setuptools<81 is pinned).
+                    warnings.filterwarnings("ignore", message=".*pkg_resources.*", category=UserWarning)
+                    import webrtcvad
             except ImportError as exc:
                 raise VoiceUnavailableError(
                     "'webrtcvad' is not installed. Install Ciphlet's voice extras on the Pi."
@@ -123,6 +128,9 @@ class OpenWakeWordProvider(WakeProvider):
         score = max(predictions.values()) if predictions else 0.0
         return score >= self._threshold
 
+    def load(self) -> None:
+        self._get_model()
+
     def reset(self) -> None:
         # openWakeWord keeps a rolling audio-feature/score buffer; clear it so
         # the phrase (or TTS echo) from before a turn can't re-trigger.
@@ -153,6 +161,13 @@ class PocketSphinxWakeProvider(WakeProvider):
     def load(self) -> None:
         """Build the decoder now (fail fast at startup instead of on first audio)."""
         self._get_decoder()
+
+    def fresh(self) -> "PocketSphinxWakeProvider":
+        # PocketSphinx adapts (cepstral mean) to the audio it has heard, so a
+        # warmed-up decoder is more sensitive than a fresh one — tests need a fresh one.
+        fresh = PocketSphinxWakeProvider(self._threshold, self._sample_rate)
+        fresh.load()
+        return fresh
 
     def _get_decoder(self):
         if self._decoder is None:
@@ -268,6 +283,9 @@ class VoskSTT(STTProvider):
                     "points at an unzipped VOSK model directory (see deploy/install_voice.sh)."
                 ) from exc
         return self._model
+
+    def load(self) -> None:
+        self._get_model()
 
     def transcribe(self, audio: bytes) -> str:
         import json

@@ -35,6 +35,8 @@ SILENCE_FRAMES_TO_STOP = 20  # ~600ms of silence ends an utterance
 NO_SPEECH_TIMEOUT_FRAMES = 200  # ~6s: give up if nothing is said after the wake word
 MAX_UTTERANCE_FRAMES = 500  # ~15s hard cap on one utterance
 POST_SPEECH_HOLDOFF_FRAMES = 15  # ~450ms of mic ignored after TTS ends, so room echo can't re-trigger wake
+WAKE_TAIL_SETTLE_FRAMES = 5  # ~150ms of silence = the wake phrase itself has ended
+WAKE_TAIL_MAX_FRAMES = 40  # ~1.2s: if speech never pauses, the user is talking straight on into their request
 ECHO_MIN_WORDS = 3  # a shorter transcript is never treated as Ciphlet hearing itself
 ECHO_OVERLAP = 0.8  # fraction of transcript words found in Ciphlet's last reply => it heard itself
 
@@ -55,6 +57,54 @@ WAKE_CHUNK_SAMPLES = 1280
 # honest heuristic — not true AEC — that filters out short echo/bleed
 # blips while still allowing a genuine, sustained interruption through.
 BARGE_IN_DEBOUNCE_FRAMES = 3  # ~90ms of sustained speech at FRAME_MS=30
+
+# Measured on the real Pi (speaker beside the mic): Ciphlet's own voice reaches
+# the mic ~14x louder than room noise and the VAD flags it as continuous speech
+# for seconds, so VAD-only barge-in cut every reply off after ~1.5 s. An
+# interruption must therefore ALSO be clearly louder than the echo: frame rms >=
+# BARGE_IN_GATE x the loudest echo seen so far in this reply. The first
+# BARGE_IN_WARMUP_FRAMES (~1.5 s) of a reply only learn the echo level.
+BARGE_IN_GATE = 2.5
+BARGE_IN_WARMUP_FRAMES = 50
+
+
+class BargeInDetector:
+    """Decides, frame by frame while Ciphlet is speaking, whether the user is
+    interrupting: VAD says speech AND the frame is markedly louder than the
+    echo level learned so far, sustained for `frames` frames. `frames` <= 0
+    disables barge-in; `gate` <= 0 falls back to VAD-only."""
+
+    def __init__(self, frames: int = BARGE_IN_DEBOUNCE_FRAMES, gate: float = BARGE_IN_GATE, warmup: int = BARGE_IN_WARMUP_FRAMES) -> None:
+        self._frames, self._gate, self._warmup = frames, gate, warmup
+        self.reset()
+
+    def reset(self) -> None:
+        """Call when Ciphlet starts a new reply."""
+        self._baseline = 0.0
+        self._since_onset: int | None = None  # frames since the echo's first speech-like frame
+        self._run = 0
+
+    def update(self, speech: bool, rms: float) -> bool:
+        if self._frames <= 0:
+            return False
+        if self._since_onset is None:
+            # Piper's audio starts ~1 s AFTER the reply is issued (synthesis lag), so the
+            # warm-up must start at the echo's onset — not at the start of the reply, or it
+            # would learn only silence and the echo itself would look like an interruption.
+            if not speech:
+                self._baseline = max(self._baseline, rms)
+                return False
+            self._since_onset = 0
+        self._since_onset += 1
+        if self._since_onset <= self._warmup:  # learn the echo level; never interrupt this early
+            self._baseline = max(self._baseline, rms)
+            return False
+        if speech and rms >= self._gate * self._baseline:
+            self._run += 1
+            return self._run >= self._frames
+        self._run = 0
+        self._baseline = max(self._baseline, rms)  # ratchet up only on frames that are not an interruption
+        return False
 
 
 def _get_sounddevice():
@@ -312,6 +362,8 @@ class HandsFreeVoiceSession:
         on_reply: Callable[[str], None] | None = None,
         barge_in_frames: int = BARGE_IN_DEBOUNCE_FRAMES,
         wake_label: str = '"Hey Ciphlet"',
+        barge_in_gate: float = BARGE_IN_GATE,
+        barge_in_warmup_frames: int = BARGE_IN_WARMUP_FRAMES,
     ) -> None:
         self._audio = audio
         self._wake = wake
@@ -329,6 +381,7 @@ class HandsFreeVoiceSession:
         # Consecutive speech frames needed to interrupt TTS; 0 disables
         # barge-in (use if the speaker bleeds into the mic — see --selftest).
         self._barge_in_frames = barge_in_frames
+        self._barge = BargeInDetector(barge_in_frames, barge_in_gate, barge_in_warmup_frames)
         self._last_reply = ""
         self._wake_label = wake_label
 
@@ -350,9 +403,14 @@ class HandsFreeVoiceSession:
         self._wake.reset()
 
     def run_forever(self) -> None:
+        import numpy as np
+
+        # Load models BEFORE the mic opens: a lazily-loaded wake model stalls the
+        # loop for seconds on its first window, and audio in that gap is lost.
+        self._wake.load()
+        self._stt.load()
         print(f"Ciphlet is listening for {self._wake_label}... (Ctrl+C to stop)")
         stream = _open_input_stream(self._input_device)
-        speech_run = 0  # consecutive speech frames seen while Ciphlet is talking — see BARGE_IN_DEBOUNCE_FRAMES
         recent: deque = deque(maxlen=max(self._barge_in_frames, 1))  # those frames, kept so the interruption isn't clipped
         was_speaking = False
         holdoff = 0
@@ -362,25 +420,22 @@ class HandsFreeVoiceSession:
                 conditioned = self._audio.condition(chunk.tobytes())
 
                 if self._speaking.is_set():
+                    if not was_speaking:
+                        self._barge.reset()  # a new reply just started: relearn the echo level
                     was_speaking = True
-                    # Interruption path (§4.6): listen while Ciphlet talks,
-                    # barge in once real speech is sustained (debounced
-                    # against self-heard TTS bleed-through — see
-                    # BARGE_IN_DEBOUNCE_FRAMES above; no hardware AEC here).
-                    if self._barge_in_frames > 0 and self._audio.is_speech(conditioned):
-                        speech_run += 1
-                        recent.append(chunk.copy())
-                        if speech_run >= self._barge_in_frames:
-                            self._tts.stop()
-                            self._speaking.clear()
-                            self._respond(self._capture_utterance(stream, list(recent)), echo_guard=True)
-                            speech_run = 0
-                            recent.clear()
-                            was_speaking = False
-                            self._reset_wake()
-                    else:
-                        speech_run = 0
+                    # Interruption path (§4.6): listen while Ciphlet talks and
+                    # barge in on sustained speech that is clearly louder than
+                    # the echo of Ciphlet's own voice (see BargeInDetector; no
+                    # hardware AEC here).
+                    rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+                    recent.append(chunk.copy())  # latest frames, so the interruption's first words aren't clipped
+                    if self._barge.update(bool(self._audio.is_speech(conditioned)), rms):
+                        self._tts.stop()
+                        self._speaking.clear()
+                        self._respond(self._capture_utterance(stream, list(recent)), echo_guard=True)
                         recent.clear()
+                        was_speaking = False
+                        self._reset_wake()
                     continue
 
                 if was_speaking:  # playback just finished on its own
@@ -391,23 +446,41 @@ class HandsFreeVoiceSession:
                     holdoff -= 1
                     continue
 
-                speech_run = 0
                 if self._check_wake(conditioned):
                     print("(wake word detected)")
-                    self._respond(self._capture_utterance(stream))
+                    self._respond(self._capture_utterance(stream, after_wake=True))
                     self._reset_wake()
         finally:
             stream.stop()
             stream.close()
 
-    def _capture_utterance(self, stream, prefix: list | None = None) -> bytes:
-        """Record until ~600ms of silence *after speech has started*. Waits up
-        to NO_SPEECH_TIMEOUT_FRAMES for the user to begin (so a pause after
-        the wake word doesn't lose the turn), and caps total length."""
+    def _capture_utterance(self, stream, prefix: list | None = None, after_wake: bool = False) -> bytes:
+        """Record until ~600ms of silence *after speech has started*. Waits up to
+        NO_SPEECH_TIMEOUT_FRAMES for the user to begin (so a pause after the
+        wake word doesn't lose the turn), and caps total length.
+
+        after_wake: the wake phrase's own trailing audio would otherwise count as
+        "speech started" and a natural pause before the request would then end
+        the capture with nothing in it. So first let the wake phrase finish (a
+        short silence) and drop it; if the user never pauses, keep it all — they
+        are talking straight on into the request."""
         import numpy as np
 
         frames = list(prefix or [])
         started = bool(frames)  # barge-in: the interrupting speech is already in `prefix`
+        if after_wake:
+            tail: list = []
+            quiet = 0
+            paused = False
+            while len(tail) < WAKE_TAIL_MAX_FRAMES:
+                chunk, _ = stream.read(FRAME_SAMPLES)
+                tail.append(chunk.copy())
+                quiet = 0 if self._audio.is_speech(self._audio.condition(chunk.tobytes())) else quiet + 1
+                if quiet >= WAKE_TAIL_SETTLE_FRAMES:
+                    paused = True
+                    break
+            if not paused:
+                frames, started = tail, True  # continuous speech: keep the wake phrase + request together
         waited = 0
         silence_run = 0
         while len(frames) < MAX_UTTERANCE_FRAMES:
@@ -429,9 +502,11 @@ class HandsFreeVoiceSession:
 
     def _respond(self, audio: bytes, echo_guard: bool = False) -> None:
         if not audio:
+            print("(heard nothing — no speech after the wake word)")
             return
         text = self._stt.transcribe(audio)
         if not text:
+            print("(heard nothing I could make out)")
             return
         if echo_guard and _is_self_echo(text, self._last_reply):
             print("(ignored — that was my own voice coming back in through the mic)")

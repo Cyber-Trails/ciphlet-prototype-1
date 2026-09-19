@@ -33,12 +33,22 @@ source .venv/bin/activate
 
 # --- 1. System packages voice needs beyond install_pi.sh's core list ---
 echo
-echo "-- Installing system packages (sudo apt) --"
-sudo apt-get update -y
+echo "-- Checking system packages --"
 # build-essential + python3-dev: webrtcvad ships sdist-only (no wheels), so pip
 # compiles its C extension against the venv Python's headers. alsa-utils:
-# aplay/amixer/arecord for speaker playback, detection and volume.
-sudo apt-get install -y unzip build-essential python3-dev alsa-utils
+# aplay/amixer/arecord for speaker playback, detection and volume. sudo (and
+# its password prompt) is only used if something is actually missing.
+MISSING_PKGS=""
+for pkg in unzip build-essential python3-dev alsa-utils; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS $pkg"
+done
+if [ -n "$MISSING_PKGS" ]; then
+    echo "Installing missing packages:$MISSING_PKGS (sudo apt)"
+    sudo apt-get update -y
+    sudo apt-get install -y $MISSING_PKGS
+else
+    echo "All required system packages already installed."
+fi
 
 # --- 2. Python voice extras (sounddevice, vosk, webrtcvad, piper-tts + openWakeWord's ONNX-path deps) ---
 echo
@@ -125,6 +135,17 @@ except VoiceUnavailableError as exc:
     print(f"Wake-word runtime check FAILED: {exc}", file=sys.stderr)
     sys.exit(1)
 print("Wake-word runtime OK (" + (path or "bundled pretrained models") + ")")
+
+# VAD: webrtcvad must actually import and classify a 30 ms frame (it needs
+# pkg_resources/setuptools on Python 3.13 venvs).
+from ciphlet.voice.providers import WebRTCVadAudioProcessor
+
+try:
+    WebRTCVadAudioProcessor().is_speech(bytes(480 * 2))
+except VoiceUnavailableError as exc:
+    print(f"VAD (webrtcvad) check FAILED: {exc}", file=sys.stderr)
+    sys.exit(1)
+print("VAD (webrtcvad) OK")
 
 # "Hey Ciphlet" via PocketSphinx keyword spotting (no trained model needed)
 from ciphlet.voice.providers import PocketSphinxWakeProvider
