@@ -86,6 +86,10 @@ class Config:
     # louder than the echo of Ciphlet's own voice at the mic (`ciphlet voice
     # --selftest` measures the echo and recommends a value). 0 = VAD only.
     barge_in_gate: float
+    # A frame whose 80-250 Hz band is at least this loud (rms units) counts as a PERSON talking
+    # over Ciphlet: its speaker has ~none there, so its echo stays far below it. This is what
+    # lets normal-volume speech interrupt a reply. 0 disables. `--selftest` checks the echo.
+    barge_in_low_level: float
     # Longest reply (characters) that is spoken aloud; longer replies are spoken
     # in part ("The rest is on screen") and printed in full. 0 = no cap.
     spoken_max_chars: int
@@ -125,7 +129,8 @@ class Config:
             audio_input_device=_parse_audio_device(os.environ.get("CIPHLET_AUDIO_INPUT_DEVICE")),
             audio_output_device=os.environ.get("CIPHLET_AUDIO_OUTPUT_DEVICE") or None,
             barge_in_frames=int(os.environ.get("CIPHLET_BARGE_IN_FRAMES") or "3"),
-            barge_in_gate=float(os.environ.get("CIPHLET_BARGE_IN_GATE") or "2.5"),
+            barge_in_gate=float(os.environ.get("CIPHLET_BARGE_IN_GATE") or "5"),
+            barge_in_low_level=float(os.environ.get("CIPHLET_BARGE_IN_LOW_LEVEL") or "130"),
             spoken_max_chars=int(os.environ.get("CIPHLET_SPOKEN_MAX_CHARS") or "600"),
             tts_volume=float(os.environ.get("CIPHLET_TTS_VOLUME") or "0.5"),
             wake_engine=(os.environ.get("CIPHLET_WAKE_ENGINE") or "auto").strip().lower(),

@@ -62,22 +62,63 @@ BARGE_IN_DEBOUNCE_FRAMES = 3  # ~90ms of sustained speech at FRAME_MS=30
 
 # Measured on the real Pi (speaker beside the mic): Ciphlet's own voice reaches
 # the mic ~14x louder than room noise and the VAD flags it as continuous speech
-# for seconds, so VAD-only barge-in cut every reply off after ~1.5 s. An
-# interruption must therefore ALSO be clearly louder than the echo: frame rms >=
-# BARGE_IN_GATE x the loudest echo seen so far in this reply. The first
-# BARGE_IN_WARMUP_FRAMES (~1.5 s) of a reply only learn the echo level.
-BARGE_IN_GATE = 2.5
+# for seconds, so VAD-only barge-in cut every reply off after ~1.5 s. Echo
+# cancellation (0.3 dB ceiling: coherence 0.08) and frame-by-frame echo prediction
+# (std 7 dB) both failed on that speaker/mic. Two detectors are used instead:
+#  1. LOW-BAND VOICE (the one that works for normal speech): the monitor speaker has
+#     ~no energy below 250 Hz, a person near the mic has plenty. A VAD-speech frame whose
+#     80-250 Hz band level is >= BARGE_IN_LOW_LEVEL is a person, not Ciphlet's echo — no
+#     baseline needed. Validated on 16 real echo-only replies (0 triggers caused by the
+#     echo; the 2 triggers were a stray word and a thump in the room) and on the owner's
+#     real voice mixed onto real echoes (40/42 interrupted, median 0.6 s). A per-FRACTION
+#     threshold was tried first and false-interrupted 10/12 replies — the absolute level is
+#     what separates them.
+#  2. LOUDNESS (backstop): frame rms >= BARGE_IN_GATE x the loudest echo seen in this reply (learned
+#     from the echo's onset) — for setups whose speaker does have bass. Kept conservative (5x)
+#     because the echo's own loud syllables trip anything lower.
+BARGE_IN_GATE = 5.0  # backstop only: at 2.5 the echo's own loud syllable false-interrupted 1 of 16 replies
 BARGE_IN_WARMUP_FRAMES = 50
+BARGE_IN_LOW_LEVEL = 130.0  # 0 disables the low-band path
+
+_LOWBAND_WINDOW = None
+
+
+def low_band_level(frame) -> float:
+    """Approximate rms level of the 80-250 Hz band of a frame. Near-field voices have
+    plenty (fundamental + proximity effect); small speakers and their echo do not."""
+    import numpy as np
+
+    global _LOWBAND_WINDOW
+    x = np.asarray(frame, dtype=np.float64).reshape(-1)
+    rms = float(np.sqrt(np.mean(x ** 2)))
+    x = x - x.mean()  # USB mics have a DC offset; through the window it would leak into the low band
+    if _LOWBAND_WINDOW is None or len(_LOWBAND_WINDOW) != len(x):
+        _LOWBAND_WINDOW = np.hanning(len(x))
+    spec = np.abs(np.fft.rfft(x * _LOWBAND_WINDOW, 512)) ** 2
+    freqs = np.fft.rfftfreq(512, 1.0 / SAMPLE_RATE)
+    total = spec[(freqs >= 80) & (freqs < 7500)].sum()
+    if total <= 1e-6:  # silence / pure DC: no spectrum to speak of
+        return 0.0
+    return float(rms * np.sqrt(spec[(freqs >= 80) & (freqs < 250)].sum() / total))
 
 
 class BargeInDetector:
     """Decides, frame by frame while Ciphlet is speaking, whether the user is
-    interrupting: VAD says speech AND the frame is markedly louder than the
-    echo level learned so far, sustained for `frames` frames. `frames` <= 0
-    disables barge-in; `gate` <= 0 falls back to VAD-only."""
+    interrupting. A frame counts toward an interruption if VAD says speech AND
+    either (a) its low-band level says a person is near the mic (see above), or
+    (b) it is markedly louder than the echo learned so far. `frames` consecutive
+    such frames fire it. `frames` <= 0 disables barge-in; `gate` <= 0 makes (b)
+    VAD-only; `low_level` <= 0 disables (a)."""
 
-    def __init__(self, frames: int = BARGE_IN_DEBOUNCE_FRAMES, gate: float = BARGE_IN_GATE, warmup: int = BARGE_IN_WARMUP_FRAMES) -> None:
+    def __init__(
+        self,
+        frames: int = BARGE_IN_DEBOUNCE_FRAMES,
+        gate: float = BARGE_IN_GATE,
+        warmup: int = BARGE_IN_WARMUP_FRAMES,
+        low_level: float = BARGE_IN_LOW_LEVEL,
+    ) -> None:
         self._frames, self._gate, self._warmup = frames, gate, warmup
+        self._low_level = low_level
         self.reset()
 
     def reset(self) -> None:
@@ -86,26 +127,31 @@ class BargeInDetector:
         self._since_onset: int | None = None  # frames since the echo's first speech-like frame
         self._run = 0
 
-    def update(self, speech: bool, rms: float) -> bool:
+    def update(self, speech: bool, rms: float, low_level: float | None = None) -> bool:
         if self._frames <= 0:
             return False
+        voice = speech and self._low_level > 0 and low_level is not None and low_level >= self._low_level
+        loud = False
         if self._since_onset is None:
-            # Piper's audio starts ~1 s AFTER the reply is issued (synthesis lag), so the
-            # warm-up must start at the echo's onset — not at the start of the reply, or it
-            # would learn only silence and the echo itself would look like an interruption.
+            # Piper's audio starts ~1-4 s AFTER the reply is issued (synthesis lag), so the
+            # loudness warm-up must start at the echo's onset — not at the start of the reply,
+            # or it would learn only silence and the echo itself would look like an interruption.
             if not speech:
                 self._baseline = max(self._baseline, rms)
-                return False
-            self._since_onset = 0
-        self._since_onset += 1
-        if self._since_onset <= self._warmup:  # learn the echo level; never interrupt this early
-            self._baseline = max(self._baseline, rms)
-            return False
-        if speech and rms >= self._gate * self._baseline:
+            else:
+                self._since_onset = 0
+        if self._since_onset is not None:
+            self._since_onset += 1
+            if self._since_onset <= self._warmup:  # learn the echo level; loudness never fires this early
+                self._baseline = max(self._baseline, rms)
+            else:
+                loud = speech and rms >= self._gate * self._baseline
+        if voice or loud:
             self._run += 1
             return self._run >= self._frames
         self._run = 0
-        self._baseline = max(self._baseline, rms)  # ratchet up only on frames that are not an interruption
+        if self._since_onset is not None and self._since_onset > self._warmup:
+            self._baseline = max(self._baseline, rms)  # ratchet up only on frames that are not an interruption
         return False
 
 
@@ -401,6 +447,7 @@ class HandsFreeVoiceSession:
         barge_in_gate: float = BARGE_IN_GATE,
         barge_in_warmup_frames: int = BARGE_IN_WARMUP_FRAMES,
         spoken_max_chars: int = SPOKEN_MAX_CHARS,
+        barge_in_low_level: float = BARGE_IN_LOW_LEVEL,
     ) -> None:
         self._audio = audio
         self._wake = wake
@@ -418,7 +465,7 @@ class HandsFreeVoiceSession:
         # Consecutive speech frames needed to interrupt TTS; 0 disables
         # barge-in (use if the speaker bleeds into the mic — see --selftest).
         self._barge_in_frames = barge_in_frames
-        self._barge = BargeInDetector(barge_in_frames, barge_in_gate, barge_in_warmup_frames)
+        self._barge = BargeInDetector(barge_in_frames, barge_in_gate, barge_in_warmup_frames, barge_in_low_level)
         self._last_reply = ""
         self._wake_label = wake_label
         self._spoken_max_chars = spoken_max_chars
@@ -467,7 +514,8 @@ class HandsFreeVoiceSession:
                     # hardware AEC here).
                     rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
                     recent.append(chunk.copy())  # latest frames, so the interruption's first words aren't clipped
-                    if self._barge.update(bool(self._audio.is_speech(conditioned)), rms):
+                    if self._barge.update(bool(self._audio.is_speech(conditioned)), rms, low_band_level(chunk)):
+                        print("(interrupted — listening)")
                         self._tts.stop()
                         self._speaking.clear()
                         self._respond(self._capture_utterance(stream, list(recent)), echo_guard=True)

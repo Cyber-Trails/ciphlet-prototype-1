@@ -39,19 +39,30 @@ def longest_run(flags) -> int:
     return best
 
 
-def would_interrupt(pairs, frames: int, gate: float) -> bool:
-    """Would the real barge-in detector have fired on this recording of
-    Ciphlet's own voice? `pairs` = [(vad_speech, frame_rms), ...]."""
-    detector = pipeline.BargeInDetector(frames, gate, pipeline.BARGE_IN_WARMUP_FRAMES)
-    return any(detector.update(speech, rms) for speech, rms in pairs)
+def would_interrupt(pairs, frames: int, gate: float, low_level: float = 0.0) -> bool:
+    """Would the real barge-in detector have fired on this recording of Ciphlet's
+    own voice? `pairs` = [(vad_speech, frame_rms[, low_band_level]), ...]."""
+    detector = pipeline.BargeInDetector(frames, gate, pipeline.BARGE_IN_WARMUP_FRAMES, low_level)
+    for speech, rms, *rest in pairs:
+        if detector.update(speech, rms, rest[0] if rest else None):
+            return True
+    return False
 
 
 def recommend_gate(pairs, frames: int, gate: float) -> float | None:
-    """Smallest gate at or above `gate` that stops Ciphlet's own echo from
-    interrupting it; None if even a very high gate doesn't (the echo is louder
-    than a person would be, so barge-in should be disabled)."""
+    """Smallest loudness gate at or above `gate` that stops Ciphlet's own echo from
+    interrupting it; None if even a very high gate doesn't."""
     for candidate in (gate, 3.5, 5.0, 8.0, 12.0):
-        if candidate >= gate and not would_interrupt(pairs, frames, candidate):
+        if candidate >= gate and not would_interrupt(pairs, frames, candidate, 0.0):
+            return candidate
+    return None
+
+
+def recommend_low_level(pairs, frames: int, low_level: float) -> float | None:
+    """Smallest low-band level at or above `low_level` that Ciphlet's own echo does not reach
+    (a bassy speaker needs a higher one); None = the echo is as low-band-heavy as a person."""
+    for candidate in (low_level, 200.0, 300.0, 500.0, 800.0, 1200.0):
+        if candidate >= low_level and not would_interrupt(pairs, frames, 1e9, candidate):
             return candidate
     return None
 
@@ -272,27 +283,42 @@ def run_selftest(
                 while speaker.is_alive():
                     chunk, _ = stream.read(pipeline.FRAME_SAMPLES)
                     rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
-                    pairs.append((bool(audio.is_speech(audio.condition(chunk.tobytes()))), rms))
+                    pairs.append((
+                        bool(audio.is_speech(audio.condition(chunk.tobytes()))),
+                        rms,
+                        pipeline.low_band_level(chunk),
+                    ))
             finally:
                 stream.stop()
                 stream.close()
-            run = longest_run([speech for speech, _ in pairs])
-            echo_rms = max((r for _, r in pairs), default=0.0)
-            frames, gate = config.barge_in_frames, config.barge_in_gate
+            run = longest_run([speech for speech, *_ in pairs])
+            echo_rms = max((p[1] for p in pairs), default=0.0)
+            echo_low = max((p[2] for p in pairs), default=0.0)
+            frames, gate, low_level = config.barge_in_frames, config.barge_in_gate, getattr(config, "barge_in_low_level", 0.0)
             detail = (
                 f"own voice reached the mic as speech for up to {run} consecutive frames ({run * pipeline.FRAME_MS} ms), "
-                f"echo peak rms {echo_rms:.0f}; barge-in needs {frames} frames >= {gate:g}x the echo"
+                f"echo peak rms {echo_rms:.0f}, echo low-band (80-250 Hz) peak level {echo_low:.0f} "
+                f"(a person talking over it must reach {low_level:.0f}; a person near the mic is typically several hundred)"
             )
             if frames <= 0:
                 report.add("PASS", "barge-in", detail + " — barge-in is disabled (CIPHLET_BARGE_IN_FRAMES=0)")
-            elif not would_interrupt(pairs, frames, gate):
+            elif not would_interrupt(pairs, frames, gate, low_level):
                 report.add("PASS", "barge-in", detail + " — Ciphlet's own voice does not interrupt it as configured")
             else:
-                rec = recommend_gate(pairs, frames, gate)
-                if rec is None:
-                    report.add("WARN", "barge-in", detail + " — the echo is too loud to tell from a person: set CIPHLET_BARGE_IN_FRAMES=0 in .env, or use headphones / a speakerphone with echo cancellation / move the speaker away from the mic")
-                else:
-                    report.add("WARN", "barge-in", detail + f" — Ciphlet would interrupt itself: set CIPHLET_BARGE_IN_GATE={rec:g} in .env")
+                advice = []
+                if low_level > 0 and would_interrupt(pairs, frames, 1e9, low_level):
+                    rec = recommend_low_level(pairs, frames, low_level)
+                    advice.append(
+                        f"set CIPHLET_BARGE_IN_LOW_LEVEL={rec:g}" if rec is not None
+                        else "set CIPHLET_BARGE_IN_LOW_LEVEL=0 (this speaker's echo has as much low-band energy as a person)"
+                    )
+                if would_interrupt(pairs, frames, gate, 0.0):
+                    rec = recommend_gate(pairs, frames, gate)
+                    advice.append(
+                        f"set CIPHLET_BARGE_IN_GATE={rec:g}" if rec is not None
+                        else "set CIPHLET_BARGE_IN_FRAMES=0 (the echo is too loud to tell from a person), or use headphones / a speakerphone with echo cancellation"
+                    )
+                report.add("WARN", "barge-in", detail + " — Ciphlet would interrupt itself: " + "; ".join(advice) + " in .env")
         except VoiceUnavailableError as exc:
             report.add("WARN", "barge-in", f"could not measure: {exc}")
 

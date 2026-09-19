@@ -153,6 +153,18 @@ Method: the Pi spoke prompts through its own speaker; the owner said "Hey Ciphle
 
 ---
 
+## Barge-in that works for speech over a reply (2026-09-19, owner-reported failure)
+
+**Report:** with the shipped defaults, speaking over Amy's reply did not stop it; the speech became a new turn after playback. Cause: the only detectors were VAD (which flags Ciphlet's own echo as continuous speech) and a loudness gate that ordinary speech never reaches (the echo at the mic is as loud as a person).
+
+**What was tried on the real Pi and failed (all measured):** waveform echo cancellation (`pyaec`/Speex, delay aligned by GCC-PHAT to a stable ~40 ms): 0–7 dB ERLE, and the reference↔mic **coherence is only 0.08** (a 0.3 dB ceiling for any linear canceller; mic AGC off and lower volume changed nothing); frame-by-frame echo-level prediction from the reference (log-level correlation 0.53, ratio std ~7 dB); a per-frame low-band *fraction* threshold (**false-interrupted 10/12 echo-only replies** — the fraction of a quiet, noise-dominated frame is meaningless; this was briefly deployed and reverted the same session).
+
+**What works — absolute low-band level (`pipeline.low_band_level`, `BargeInDetector`):** the monitor speaker has essentially no energy below 250 Hz; a person near the mic does. A VAD-speech frame whose 80-250 Hz level is ≥ `CIPHLET_BARGE_IN_LOW_LEVEL` (130; room noise ≈ 30, echo peak ≈ 100) for 3 frames (~90 ms) is a person → the reply stops, and the interrupting frames are kept and transcribed (`(interrupted — listening)` is printed). The old loudness gate stays only as a backstop, raised to 5× (`CIPHLET_BARGE_IN_GATE`) because at 2.5× the echo's own loud syllables false-interrupted 1 of 16 replies. Evaluated offline on the Pi with the shipped code, fresh VAD per recording (webrtcvad is stateful — an earlier run reusing one VAD was order-dependent): **16 real echo-only replies — 0 interruptions caused by the echo** (2 triggers, audited with VOSK: a stray word "which" and a noise burst); **the owner's real recorded voice digitally mixed onto real recorded echoes: 53/56 interrupted (95%), median 0.60 s, p90 1.04 s.** Mixed audio is a linear stand-in for talking over a reply, not the same as live speech; DC offsets are removed before the spectrum (a USB mic's offset otherwise scored as "low band").
+
+**Limits:** the 130 level is tuned to this speaker (no bass), this mic and this speaker's voice; a speaker with real bass, or a very quiet/far talker (< ~130 in the low band), will not work — `ciphlet voice --selftest` measures the echo's low-band peak against the level and recommends a value or disabling it. Room noises (a thump, a stray word) also interrupt a reply, correctly, since someone made a sound. Live confirmation with the owner talking over an active reply is recorded below when done.
+
+---
+
 ## Clean Rebuild / Adopt-Adapt — local intelligence + voice pipeline replaced
 
 **Everything below this section (the three `local_provider.py`/llama-cli rounds) describes a superseded approach.** The per-request `llama-cli` subprocess local brain was abandoned after being implemented, deployed, and proven unusable on the Pi across three repair rounds (context/timeout hang, then a build-incompatible `-no-cnv` flag) — kept below only as historical record of what was tried and why it didn't work, not as current state.

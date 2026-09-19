@@ -25,10 +25,16 @@ from ciphlet.voice import pipeline
 from ciphlet.voice.base import AudioProcessor, STTProvider, TTSProvider, VoiceUnavailableError, WakeProvider
 
 SIL, SPK, WAKE = 0, 1, 7
-ECHO, LOUD = 300, 1500  # Ciphlet's own voice at the mic vs. a user clearly louder than it
+ECHO, LOUD = 300, 2000  # Ciphlet's own voice at the mic vs. a user clearly louder than it
+VOICE = 777  # marker: a person's voice — carries real low-band (150 Hz) energy, unlike the echo
 
 
 def frame(kind: int):
+    if kind == VOICE:  # a 150 Hz voice fundamental at echo-like loudness (marker in sample 0 for the fake VAD)
+        t = np.arange(pipeline.FRAME_SAMPLES) / pipeline.SAMPLE_RATE
+        f = (400 * np.sin(2 * np.pi * 150 * t)).astype(np.int16)
+        f[0] = VOICE
+        return f.reshape(-1, 1)
     return np.full((pipeline.FRAME_SAMPLES, 1), kind, dtype=np.int16)
 
 
@@ -60,7 +66,7 @@ class FakeAudio(AudioProcessor):
         return audio
 
     def is_speech(self, chunk):
-        return int(np.frombuffer(chunk, dtype=np.int16)[0]) in (SPK, ECHO, LOUD)
+        return int(np.frombuffer(chunk, dtype=np.int16)[0]) in (SPK, ECHO, LOUD, VOICE)
 
 
 class FakeWake(WakeProvider):
@@ -256,6 +262,70 @@ class BargeInDetectorTests(unittest.TestCase):
         self.assertTrue(any(self.feed(vad_only, [(True, 300.0)] * 5)))  # the old behaviour
 
 
+@unittest.skipIf(np is None, "numpy not installed")
+class LowBandTests(unittest.TestCase):
+    """Real Pi finding: the monitor speaker puts ~nothing below 250 Hz, a person near the mic does.
+    The ABSOLUTE 80-250 Hz level separates them; a per-fraction threshold false-interrupted 10/12 replies."""
+
+    def tone(self, hz, amp=3000):
+        t = np.arange(pipeline.FRAME_SAMPLES) / pipeline.SAMPLE_RATE
+        return (amp * np.sin(2 * np.pi * hz * t)).astype(np.int16)
+
+    def test_low_voice_fundamental_scores_high_and_speaker_band_content_scores_low(self):
+        self.assertGreater(pipeline.low_band_level(self.tone(150)), 1500)
+        for hz in (700, 1200, 2000):  # where the monitor speaker (and its echo) has its energy
+            self.assertLess(pipeline.low_band_level(self.tone(hz)), 30, hz)
+
+    def test_level_is_absolute_not_a_fraction(self):
+        # the same spectral shape at 1/20th the loudness (a quiet, noise-dominated frame) must score low:
+        # this is exactly what a per-fraction threshold got wrong on the Pi
+        loud, quiet = self.tone(150, 3000), self.tone(150, 150)
+        self.assertGreater(pipeline.low_band_level(loud), 20 * pipeline.low_band_level(quiet) * 0.9)
+        self.assertLess(pipeline.low_band_level(quiet), pipeline.BARGE_IN_LOW_LEVEL)
+
+    def test_dc_offset_and_silence_do_not_look_like_a_low_voice(self):
+        # a USB mic's DC offset leaked through the window and scored as "low band"
+        self.assertEqual(pipeline.low_band_level(np.full(pipeline.FRAME_SAMPLES, 300, dtype=np.int16)), 0.0)
+        self.assertEqual(pipeline.low_band_level(np.zeros(pipeline.FRAME_SAMPLES, dtype=np.int16)), 0.0)
+        self.assertLess(pipeline.low_band_level(self.tone(1200) + 500), 30)  # tone + DC offset
+
+    def test_accepts_the_int16_frame_shape_the_stream_returns(self):
+        self.assertEqual(pipeline.low_band_level(self.tone(150).reshape(-1, 1)), pipeline.low_band_level(self.tone(150)))
+
+
+class LowBandDetectorTests(unittest.TestCase):
+    def det(self, **kw):
+        return pipeline.BargeInDetector(**{"frames": 3, "gate": 2.5, "warmup": 10, "low_level": 130.0, **kw})
+
+    def feed(self, det, seq):
+        return [det.update(*x) for x in seq]
+
+    def test_a_person_at_echo_loudness_interrupts_immediately_even_during_warmup(self):
+        det = self.det()
+        # echo-like overall loudness (300), VAD says speech, but a person's low-band level (250)
+        self.assertEqual(self.feed(det, [(True, 300.0, 250.0)] * 4), [False, False, True, True])
+
+    def test_pure_echo_never_interrupts_however_long_it_lasts(self):
+        det = self.det()
+        self.assertFalse(any(self.feed(det, [(True, 300.0, 5.0)] * 400)))  # echo: ~no low band
+
+    def test_low_band_alone_is_not_enough_it_must_be_speech_and_reach_the_level(self):
+        det = self.det()
+        self.assertFalse(any(self.feed(det, [(False, 300.0, 400.0)] * 20)))  # not speech (hum/thump)
+        self.assertFalse(any(self.feed(det, [(True, 300.0, 60.0)] * 20)))  # below the level (room noise)
+
+    def test_a_short_low_band_blip_is_not_an_interruption(self):
+        det = self.det()
+        self.assertFalse(any(self.feed(det, [(True, 300.0, 250.0)] * 2 + [(True, 300.0, 5.0)] + [(True, 300.0, 250.0)] * 2)))
+
+    def test_can_be_disabled_and_the_loudness_path_still_works(self):
+        det = self.det(low_level=0)
+        self.assertFalse(any(self.feed(det, [(True, 300.0, 400.0)] * 100)))  # low-band path off
+        det = self.det()
+        self.feed(det, [(True, 300.0, 5.0)] * 60)
+        self.assertTrue(any(self.feed(det, [(True, 1500.0, 5.0)] * 4)))  # loud, no bass: the gate still catches it
+
+
 class EchoGuardTests(unittest.TestCase):
     def test_own_voice_is_recognised_but_real_speech_and_short_replies_are_not(self):
         reply = "The time is twelve thirty in the afternoon"
@@ -358,6 +428,26 @@ class HandsFreeLoopTests(unittest.TestCase):
                 pass
         self.assertEqual(tts.stops, 1)  # exactly one stop: the loud voice, not the 200 frames of echo
         self.assertEqual(brain, ["what is the capital of france", "wait I have a different question"])
+
+    def test_a_person_talking_over_the_reply_at_echo_loudness_stops_it_and_is_captured(self):
+        """The reported failure: speaking over Amy did not stop her. A person's low-band
+        voice at the SAME loudness as the echo must now stop the reply immediately, and the
+        interrupting speech must reach STT."""
+        tts = FakeTTS(block=True)
+        stt = FakeSTT("what is the capital of france", "wait what about germany")
+        session, brain = make_session(stt, tts, replies=["Paris is the capital of France and so on and so forth."], barge_in_warmup_frames=10, barge_in_low_level=130.0)
+        script = [WAKE] * 3 + [SIL] * 6 + [SPK] * 5 + [SIL] * 25 + [SIL] * 2
+        stream = ScriptedStream(script + [ECHO] * 120 + [VOICE] * 10 + [SIL] * 30)
+        stream.on_read = lambda i: tts.started.wait(2) if i == len(script) else None
+        out = io.StringIO()
+        with mock.patch.object(pipeline, "_open_input_stream", return_value=stream), redirect_stdout(out):
+            try:
+                session.run_forever()
+            except KeyboardInterrupt:
+                pass
+        self.assertIn("(interrupted", out.getvalue())  # visible in the log, not silent
+        self.assertEqual(tts.stops, 1)  # stopped by the voice, not by 120 frames of echo
+        self.assertEqual(brain, ["what is the capital of france", "wait what about germany"])  # the interruption was heard
 
     def test_echo_alone_lets_the_whole_reply_play(self):
         tts = FakeTTS(block=True)

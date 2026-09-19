@@ -56,10 +56,10 @@ class RunSelftestTests(unittest.TestCase):
         self.config = SimpleNamespace(
             audio_input_device="hw:2,0", audio_output_device="plughw:CARD=Device,DEV=0",
             piper_model_path=str(d / "v.onnx"), vosk_model_path=str(d / "vosk"),
-            wake_model_path=None, barge_in_frames=3, barge_in_gate=2.5,
+            wake_model_path=None, barge_in_frames=3, barge_in_gate=2.5, barge_in_low_level=130.0,
         )
 
-    def providers(self, mic_level=3000, heard="hello ciphlet", echo_is_speech=False, speak_error=None, echo_amps=None):
+    def providers(self, mic_level=3000, heard="hello ciphlet", echo_is_speech=False, speak_error=None, echo_amps=None, echo_hz=None):
         state = {"echo": False, "n": 0}
 
         class TTS:
@@ -95,7 +95,11 @@ class RunSelftestTests(unittest.TestCase):
             def read(_, n):
                 if state["echo"] and echo_amps is not None:  # loudness profile of Ciphlet's own voice at the mic
                     state["n"] += 1
-                    return np.full((n, 1), echo_amps(state["n"]), dtype=np.int16), False
+                    amp = echo_amps(state["n"])
+                    if echo_hz:  # tonal echo (e.g. a speaker with real bass at 150 Hz)
+                        t = np.arange(n) / pipeline.SAMPLE_RATE
+                        return (amp * np.sin(2 * np.pi * echo_hz * t)).astype(np.int16).reshape(-1, 1), False
+                    return np.full((n, 1), amp, dtype=np.int16), False
                 return np.full((n, 1), mic_level, dtype=np.int16), False
             def stop(_): pass
             def close(_): pass
@@ -160,8 +164,8 @@ class RunSelftestTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("[WARN] microphone", out)
 
-    def bleed(self, echo_amps):
-        return self.run_it(echo_is_speech=True, echo_amps=echo_amps)
+    def bleed(self, echo_amps, echo_hz=None):
+        return self.run_it(echo_is_speech=True, echo_amps=echo_amps, echo_hz=echo_hz)
 
     def test_echo_that_never_exceeds_itself_does_not_interrupt_as_configured(self):
         # VAD flags Ciphlet's own voice as speech throughout (the real Pi case), but the
@@ -177,6 +181,23 @@ class RunSelftestTests(unittest.TestCase):
         self.assertEqual(code, 0)  # advice, not a failure
         self.assertIn("[WARN] barge-in", out)
         self.assertIn("CIPHLET_BARGE_IN_GATE=5", out)
+
+    def test_a_speaker_with_bass_is_reported_and_the_low_band_path_gets_a_recommendation(self):
+        # Ciphlet's echo carrying real 150 Hz energy (level ~420) reads as a person to the low-band path.
+        code, out = self.bleed(lambda i: 600, echo_hz=150)
+        self.assertEqual(code, 0)
+        self.assertIn("[WARN] barge-in", out)
+        self.assertIn("CIPHLET_BARGE_IN_LOW_LEVEL=500", out)  # smallest candidate above the echo's own level
+        self.assertIn("low-band", out)
+
+    def test_a_very_bassy_echo_recommends_disabling_the_low_band_path(self):
+        code, out = self.bleed(lambda i: 5000, echo_hz=150)
+        self.assertIn("CIPHLET_BARGE_IN_LOW_LEVEL=0", out)
+
+    def test_normal_echo_reports_its_low_band_level_and_passes(self):
+        code, out = self.bleed(lambda i: 300)
+        self.assertIn("[PASS] barge-in", out)
+        self.assertIn("low-band (80-250 Hz) peak level", out)
 
     def test_an_echo_no_gate_can_separate_recommends_disabling_barge_in(self):
         warm = pipeline.BARGE_IN_WARMUP_FRAMES
@@ -208,7 +229,7 @@ class WakePhraseStageTests(unittest.TestCase):
         (d / "vosk").mkdir()
         self.config = SimpleNamespace(
             audio_input_device=None, audio_output_device=None, piper_model_path=str(d / "v.onnx"),
-            vosk_model_path=str(d / "vosk"), wake_model_path=None, barge_in_frames=3, barge_in_gate=2.5,
+            vosk_model_path=str(d / "vosk"), wake_model_path=None, barge_in_frames=3, barge_in_gate=2.5, barge_in_low_level=130.0,
         )
 
     def run_it(self, wake_behaviour):

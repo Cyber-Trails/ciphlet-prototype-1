@@ -236,6 +236,7 @@ def run_voice(args: argparse.Namespace) -> None:
                 on_reply=_print_brain_info,
                 barge_in_frames=config.barge_in_frames,
                 barge_in_gate=config.barge_in_gate,
+                barge_in_low_level=config.barge_in_low_level,
                 wake_label=wake_label,
                 spoken_max_chars=config.spoken_max_chars,
             )
