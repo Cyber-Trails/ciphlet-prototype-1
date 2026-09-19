@@ -35,12 +35,25 @@ source .venv/bin/activate
 echo
 echo "-- Installing system packages (sudo apt) --"
 sudo apt-get update -y
-sudo apt-get install -y unzip
+# build-essential + python3-dev: webrtcvad ships sdist-only (no wheels), so pip
+# compiles its C extension against the venv Python's headers.
+sudo apt-get install -y unzip build-essential python3-dev
 
-# --- 2. Python voice extras (sounddevice, vosk, openwakeword, webrtcvad, piper-tts) ---
+# --- 2. Python voice extras (sounddevice, vosk, webrtcvad, piper-tts + openWakeWord's ONNX-path deps) ---
 echo
 echo "-- Installing Ciphlet voice extras (pip) --"
 pip install -e '.[voice]'
+
+# openWakeWord is installed separately with --no-deps: its metadata hard-requires
+# `tflite-runtime` on Linux, which has no wheels for Python >= 3.12 (Pi OS ships
+# 3.13), so a normal install is unsatisfiable. Ciphlet runs openWakeWord on its
+# ONNX backend instead (see ciphlet/voice/providers.py), and its real runtime
+# deps (onnxruntime, scipy, scikit-learn, tqdm, requests) are already installed
+# by the '.[voice]' extra above. Exact pin: --no-deps bypasses the resolver, and
+# the ONNX-only path was verified against 0.6.0 specifically.
+echo
+echo "-- Installing openWakeWord 0.6.0 (--no-deps, ONNX backend; no tflite-runtime) --"
+pip install --no-deps 'openwakeword==0.6.0'
 
 MODELS_DIR="$REPO_ROOT/models"
 mkdir -p "$MODELS_DIR/piper" "$MODELS_DIR/vosk"
@@ -91,6 +104,27 @@ python3 -c "import openwakeword.utils as u; u.download_models()"
 # This just checks whether the trained file has already been placed here.
 WAKE_MODEL="$MODELS_DIR/wake/hey_ciphlet.onnx"
 mkdir -p "$MODELS_DIR/wake"
+
+# --- 7. Wake-word smoke test: load the model(s) through Ciphlet's own provider ---
+# Fails the install loudly here rather than at first `ciphlet voice --hands-free`.
+# Runs one silent 80ms window (1280 samples of int16) through the ONNX pipeline.
+echo
+echo "-- Verifying wake-word runtime (ONNX backend) --"
+WAKE_CHECK_PATH=""
+[ -f "$WAKE_MODEL" ] && WAKE_CHECK_PATH="$WAKE_MODEL"
+WAKE_CHECK_PATH="$WAKE_CHECK_PATH" python3 - <<'PY'
+import os, sys
+from ciphlet.voice.base import VoiceUnavailableError
+from ciphlet.voice.providers import OpenWakeWordProvider
+
+path = os.environ.get("WAKE_CHECK_PATH") or None
+try:
+    OpenWakeWordProvider(model_path=path).detect(bytes(1280 * 2))
+except VoiceUnavailableError as exc:
+    print(f"Wake-word runtime check FAILED: {exc}", file=sys.stderr)
+    sys.exit(1)
+print("Wake-word runtime OK (" + (path or "bundled pretrained models") + ")")
+PY
 
 echo
 echo "== Voice runtime setup complete =="

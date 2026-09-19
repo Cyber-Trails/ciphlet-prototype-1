@@ -30,9 +30,22 @@ voice = [
     "sounddevice>=0.4",
     "numpy>=1.26",
     "vosk>=0.3.45",
-    "openwakeword>=0.6",
     "webrtcvad>=2.0.10",
     "piper-tts>=1.2",
+    # openWakeWord is deliberately NOT listed here — deploy/install_voice.sh
+    # installs it with `pip install --no-deps 'openwakeword==0.6.0'`.
+    # Its metadata hard-requires `tflite-runtime` on Linux, which has no
+    # wheels past CPython 3.11 (Pi OS ships 3.13 → unsatisfiable), and no
+    # newer openWakeWord exists on PyPI. Ciphlet runs it on the ONNX backend
+    # instead (OpenWakeWordProvider passes inference_framework="onnx"), so
+    # tflite is never needed. The lines below are openWakeWord 0.6.0's other
+    # runtime imports (verified against its 0.6.0 source), declared here
+    # since --no-deps skips them. Bump the pin only after re-verifying.
+    "onnxruntime>=1.10,<2",
+    "scipy>=1.3,<2",
+    "scikit-learn>=1,<2",
+    "tqdm>=4,<5",
+    "requests>=2,<3",
 ]
 
 [project.scripts]

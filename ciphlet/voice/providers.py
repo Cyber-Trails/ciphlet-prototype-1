@@ -9,7 +9,8 @@ These are the leading candidates named in §20B, not a frozen final stack:
 - WebRTCVadAudioProcessor — WebRTC-class VAD. `condition()` is currently a
   pass-through placeholder; RNNoise-class denoising and real acoustic-echo
   mitigation are future work, not implemented here.
-- OpenWakeWordProvider — openWakeWord. Ships with generic pretrained models
+- OpenWakeWordProvider — openWakeWord, run on its ONNX backend (no
+  tflite-runtime). Ships with generic pretrained models
   only; a custom "Hey Ciphlet" model must be trained before wake detection
   matches the intended phrase (§4.1). Point CIPHLET_WAKE_MODEL at a trained
   model file once one exists.
@@ -76,17 +77,24 @@ class OpenWakeWordProvider(WakeProvider):
                 from openwakeword.model import Model
             except ImportError as exc:
                 raise VoiceUnavailableError(
-                    "'openwakeword' is not installed. Install Ciphlet's voice extras on the Pi."
+                    f"'openwakeword' (or one of its dependencies) is not importable: {exc}. "
+                    "Run deploy/install_voice.sh on the Pi — it installs openWakeWord separately "
+                    "(--no-deps) because its tflite-runtime requirement is unsatisfiable on Python 3.13."
                 ) from exc
             kwargs = {"wakeword_models": [self._model_path]} if self._model_path else {}
             try:
-                self._model = Model(**kwargs)
+                # ONNX backend explicitly: tflite-runtime has no wheels for
+                # Python >= 3.12 (see pyproject.toml voice extra), and
+                # openWakeWord's implicit tflite->onnx fallback only fires
+                # in some cases and logs a misleading warning.
+                self._model = Model(inference_framework="onnx", **kwargs)
             except Exception as exc:
                 where = f" from '{self._model_path}'" if self._model_path else " (bundled pretrained models)"
                 raise VoiceUnavailableError(
                     f"Failed to load openWakeWord model{where}: {exc}. If using the bundled "
                     "pretrained models, run: python3 -c \"import openwakeword.utils as u; u.download_models()\". "
-                    "If using CIPHLET_WAKE_MODEL, check the path is a valid .onnx/.tflite model file."
+                    "If using CIPHLET_WAKE_MODEL, check the path is a valid .onnx model file "
+                    "(.tflite models are not supported — Ciphlet runs openWakeWord on ONNX)."
                 ) from exc
         return self._model
 
