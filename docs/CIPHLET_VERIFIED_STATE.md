@@ -97,6 +97,13 @@ This section is the authoritative current state for the local brain. Everything 
 
 ---
 
+## Pi deployment topology and reachability (2026-09-19)
+
+- **Topology (owner-stated):** Mac `/Users/ciphertrail/Developer/CIPHLET` (`main`) is canonical. The Pi runtime is `ciphlet@10.0.0.23:/home/ciphlet/Developer/CIPHLET` (venv `.venv`), and it is **not a git repo** — deploy with rsync, never `git pull`. `deploy/sync_to_pi.sh [--dry-run] [--install]` encodes this: no `--delete`, and `.env`, `.venv`, `models/`, `data/`, `*.db*`, caches are excluded so Pi runtime state and secrets are never touched (exclusions verified against a local stand-in: existing `.env`/venv/models/db/Pi-only files survive, code updates, `--dry-run` changes nothing).
+- **Reachability finding:** when the integrated-voice assignment was attempted, `10.0.0.23` was unreachable from the Mac (same `10.0.0.0/24`, ARP incomplete, ping 100% loss, SSH timeout) and no other host on the subnet had port 22 open — the Pi was off, off-network, or on another network. **No Pi verification of commit `050f8e6` has been performed**; every claim in the "Integrated voice bring-up" section above remains fake-device-tested only.
+
+---
+
 ## Clean Rebuild / Adopt-Adapt — local intelligence + voice pipeline replaced
 
 **Everything below this section (the three `local_provider.py`/llama-cli rounds) describes a superseded approach.** The per-request `llama-cli` subprocess local brain was abandoned after being implemented, deployed, and proven unusable on the Pi across three repair rounds (context/timeout hang, then a build-incompatible `-no-cnv` flag) — kept below only as historical record of what was tried and why it didn't work, not as current state.
