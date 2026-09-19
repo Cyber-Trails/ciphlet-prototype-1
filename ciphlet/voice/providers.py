@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -312,6 +313,20 @@ class VoskSTT(STTProvider):
         return result.get("text", "").strip()
 
 
+# How Piper should SAY names it would otherwise mispronounce. espeak reads "Ciphlet" as
+# /sˈɪflɪt/ ("SIF-lit"); the intended pronunciation is SIGH-flit (spec: "Ciphlet is pronounced
+# SIGH-flit"), which the respelling "Sighflet" produces through Piper's normal text path
+# (/sˈaɪflɪt/, verified on the Pi voice model) — no hyphen, so no pause, and "'s" still works.
+# (Raw [[IPA]] blocks were rejected: they garble the neighbouring words' stress.)
+PRONUNCIATIONS = {"ciphlet": "Sighflet"}
+_PRONUNCIATION_RE = re.compile(r"\b(" + "|".join(map(re.escape, PRONUNCIATIONS)) + r")\b", re.IGNORECASE)
+
+
+def apply_pronunciations(text: str) -> str:
+    """Respell words in `text` so Piper says them correctly (spoken form only; printed text is untouched)."""
+    return _PRONUNCIATION_RE.sub(lambda m: PRONUNCIATIONS[m.group(1).lower()], text)
+
+
 def _playback_device(device: str | None) -> str | None:
     """`aplay -D` value. A bare `hw:X,Y` is raw hardware with NO rate/format
     conversion, so it fails whenever the speaker's supported rates differ from
@@ -405,7 +420,7 @@ class PiperTTS(TTSProvider):
             try:
                 assert piper.stdin is not None
                 try:
-                    piper.stdin.write(text.encode("utf-8"))
+                    piper.stdin.write(apply_pronunciations(text).encode("utf-8"))
                     piper.stdin.close()
                 except BrokenPipeError:
                     pass  # piper died early; its exit code + stderr are reported below
@@ -438,7 +453,7 @@ class PiperTTS(TTSProvider):
         """Raw mono S16 PCM for `text` and its sample rate, without playing it
         (used by `ciphlet voice --selftest` to test wake detection)."""
         cmd = [*self._piper_command(), "--model", self._model_path, "--output-raw"]
-        result = subprocess.run(cmd, input=text.encode("utf-8"), capture_output=True, timeout=60)
+        result = subprocess.run(cmd, input=apply_pronunciations(text).encode("utf-8"), capture_output=True, timeout=60)
         if result.returncode != 0:
             raise VoiceUnavailableError(
                 f"Piper synthesis failed (exit {result.returncode}): {result.stderr.decode(errors='replace').strip()}"

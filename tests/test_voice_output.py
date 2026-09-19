@@ -34,6 +34,34 @@ class PlaybackDeviceTests(unittest.TestCase):
             self.assertEqual(_playback_device(d), d)
 
 
+class PronunciationTests(unittest.TestCase):
+    """The owner: Piper said "Seeflet"; it must say SIGH-flit, with no pause."""
+
+    def test_the_name_is_respelled_for_speech_in_every_form_it_appears(self):
+        from ciphlet.voice.providers import apply_pronunciations
+
+        self.assertEqual(apply_pronunciations("Hi, I am Ciphlet."), "Hi, I am Sighflet.")
+        self.assertEqual(apply_pronunciations("Ciphlet's ready, CIPHLET!"), "Sighflet's ready, Sighflet!")
+        self.assertEqual(apply_pronunciations("ciphlet, hello"), "Sighflet, hello")
+        self.assertNotIn("-", apply_pronunciations("Ciphlet"))  # a hyphen would make Piper pause
+
+    def test_other_words_are_untouched(self):
+        from ciphlet.voice.providers import apply_pronunciations
+
+        for text in ("ciphers are a type of encryption", "the tablet is here", "Ciphletting", "No names here."):
+            self.assertEqual(apply_pronunciations(text), text)
+
+    def test_the_text_piper_receives_is_the_respelled_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "v.onnx.json").write_text('{"audio": {"sample_rate": 16000}}')
+            got = d / "stdin.txt"
+            piper = _script(d / "piper", f'cat > {got}\nprintf "RAWPCM"\n')
+            aplay = _script(d / "aplay", "cat >/dev/null\n")
+            PiperTTS(str(d / "v.onnx"), piper_bin=piper, player_bin=aplay).speak("Hello, I am Ciphlet.")
+            self.assertEqual(got.read_text(), "Hello, I am Sighflet.")
+
+
 class VoiceRateTests(unittest.TestCase):
     def test_rate_comes_from_the_voice_json_with_fallback(self):
         with tempfile.TemporaryDirectory() as d:
